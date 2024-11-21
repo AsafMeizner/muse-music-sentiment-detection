@@ -37,7 +37,8 @@ def filter_songs_with_audio_samples(input_csv, output_csv):
     """Filter songs with audio samples and write them directly to the output file."""
     # Load the dataset
     data = pd.read_csv(input_csv)
-    
+    print(f"Processing {len(data)} songs from the input CSV.")
+
     # Check if the output file already exists
     if os.path.exists(output_csv):
         processed_data = pd.read_csv(output_csv)
@@ -50,15 +51,16 @@ def filter_songs_with_audio_samples(input_csv, output_csv):
 
     # Process songs
     for index, row in data.iterrows():
+        print(f"Processing song {index + 1}/{len(data)}: {row['track']} - {row['artist']}")
         spotify_id = row.get('spotify_id')
         if spotify_id in processed_spotify_ids:
+            print(f"Skipping already processed song: {spotify_id}")
             continue  # Skip already processed songs
         
         if spotify_id and check_audio_sample(spotify_id):
             # Append the valid song to the output file
             with open(output_csv, 'a') as f:
-                row.to_frame().T.to_csv(f, index=False, header=False)
-            
+                row.to_frame().T.to_csv(f, index=False, header=f.tell() == 0)  # Write header only once
             print(f"Added: {row['track']} - {row['artist']} with Spotify ID {spotify_id}")
         
         processed_spotify_ids.add(spotify_id)  # Mark as processed
