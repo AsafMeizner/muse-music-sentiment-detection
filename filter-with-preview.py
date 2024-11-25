@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import time
+import requests
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
 from requests.exceptions import HTTPError
@@ -19,7 +20,8 @@ def check_audio_sample(spotify_id):
     """Check if a song has an audio sample on Spotify."""
     try:
         track = sp.track(spotify_id)
-        return track.get('preview_url') is not None
+        preview_url = track.get('preview_url')
+        return preview_url
     except HTTPError as e:
         if e.response.status_code == 429:  # Rate limit error
             retry_after = int(e.response.headers.get("Retry-After", 1))
@@ -28,26 +30,46 @@ def check_audio_sample(spotify_id):
             return check_audio_sample(spotify_id)  # Retry the request
         else:
             print(f"Error checking Spotify ID {spotify_id}: {e}")
-            return False
+            return None
     except Exception as e:
         print(f"Unexpected error for Spotify ID {spotify_id}: {e}")
-        return False
+        return None
 
-def filter_songs_with_audio_samples(input_csv, output_csv):
-    """Filter songs with audio samples and write them directly to the output file."""
+def download_audio_preview(preview_url, output_folder, spotify_id):
+    """Download audio preview and return the local file path."""
+    try:
+        response = requests.get(preview_url, stream=True)
+        if response.status_code == 200:
+            local_filename = os.path.join(output_folder, f"{spotify_id}.mp3")
+            with open(local_filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    f.write(chunk)
+            return local_filename
+        else:
+            print(f"Failed to download preview for {spotify_id}. Status code: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Error downloading preview for {spotify_id}: {e}")
+        return None
+
+def filter_songs_with_audio_samples(input_csv, output_csv, previews_folder):
+    """Filter songs with audio samples, download previews, and update the output CSV dynamically."""
+    # Ensure the previews folder exists
+    os.makedirs(previews_folder, exist_ok=True)
+
     # Load the dataset
-    data = pd.read_csv(input_csv)
+    data = pd.read_csv(input_csv, encoding="utf-8")
     print(f"Processing {len(data)} songs from the input CSV.")
 
-    # Check if the output file already exists
+    # Check if the output file already exists and load processed Spotify IDs
+    processed_spotify_ids = set()
     if os.path.exists(output_csv):
-        processed_data = pd.read_csv(output_csv)
+        processed_data = pd.read_csv(output_csv, encoding="utf-8")
         processed_spotify_ids = set(processed_data['spotify_id'])
     else:
         # Initialize an empty CSV if it doesn't exist
-        with open(output_csv, 'w') as f:
+        with open(output_csv, 'w', encoding="utf-8") as f:
             data.iloc[0:0].to_csv(f, index=False)  # Write header only
-        processed_spotify_ids = set()
 
     # Process songs
     for index, row in data.iterrows():
@@ -57,11 +79,17 @@ def filter_songs_with_audio_samples(input_csv, output_csv):
             print(f"Skipping already processed song: {spotify_id}")
             continue  # Skip already processed songs
         
-        if spotify_id and check_audio_sample(spotify_id):
-            # Append the valid song to the output file
-            with open(output_csv, 'a') as f:
-                row.to_frame().T.to_csv(f, index=False, header=f.tell() == 0)  # Write header only once
-            print(f"Added: {row['track']} - {row['artist']} with Spotify ID {spotify_id}")
+        preview_url = check_audio_sample(spotify_id)
+        if preview_url:
+            local_file_path = download_audio_preview(preview_url, previews_folder, spotify_id)
+            if local_file_path:
+                # Add the local file path to the row
+                row['preview_path'] = local_file_path
+                
+                # Append the valid song to the output file
+                with open(output_csv, 'a', encoding="utf-8") as f:
+                    row.to_frame().T.to_csv(f, index=False, header=f.tell() == 0)  # Write header only once
+                print(f"Added: {row['track']} - {row['artist']} with Spotify ID {spotify_id}")
         
         processed_spotify_ids.add(spotify_id)  # Mark as processed
 
@@ -70,6 +98,7 @@ def filter_songs_with_audio_samples(input_csv, output_csv):
 # Input and output file paths
 input_csv = "muse_dataset.csv"  # Original dataset
 output_csv = "filtered_dataset.csv"  # File for songs with audio samples
+previews_folder = "audio_previews"  # Folder to save audio previews
 
 # Run the filtering process
-filter_songs_with_audio_samples(input_csv, output_csv)
+filter_songs_with_audio_samples(input_csv, output_csv, previews_folder)
