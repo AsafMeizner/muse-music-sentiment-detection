@@ -1,67 +1,98 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Optionally disable oneDNN optimizations if needed
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Optionally disable oneDNN optimizations
 
-import pandas as pd
+import random
 import numpy as np
+import pandas as pd
 import librosa
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
+from tensorflow.keras.models import Model # type: ignore
+from tensorflow.keras.layers import ( # type: ignore
     Dense, Dropout, Input, Conv2D, BatchNormalization, Activation, MaxPooling2D,
     Bidirectional, LSTM, Permute, Reshape
+    # Optionally add attention layer if desired
 )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam # type: ignore
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau # type: ignore
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
-from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
-from functools import partial
-import pickle
-import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 import seaborn as sns
+import pickle
+
+# Set seeds for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+#############################################
+# Hyperparameters
+#############################################
+MAX_PAD_LENGTH = 300
+TOP_GENRES = 10  # Adjust as needed for your dataset
+BATCH_SIZE = 32
+EPOCHS = 100
+LEARNING_RATE = 1e-4
+
+#############################################
+# Data Augmentation for Training
+#############################################
+def augment_audio(y, sr):
+    # Simple augmentation: random time-stretch, pitch shift, and noise
+    if np.random.rand() > 0.5:
+        rate = np.random.uniform(0.9, 1.1)
+        y = librosa.effects.time_stretch(y, rate=rate)
+    if np.random.rand() > 0.5:
+        steps = np.random.randint(-2, 3)
+        y = librosa.effects.pitch_shift(y, sr=sr, n_steps=steps)
+    if np.random.rand() > 0.5:
+        noise = np.random.normal(0, 0.005, y.shape)
+        y = y + noise
+    return y
 
 #############################################
 # Audio Feature Extraction
 #############################################
-def extract_audio_features_librosa(file_path, max_pad_length=300):
+def extract_audio_features_librosa(file_path, max_pad_length=300, augment=False):
     try:
         y, sr = librosa.load(file_path, sr=None, mono=True, duration=30)
         if y is None or len(y) == 0:
-            print(f"[Warning] Loaded audio is empty for {file_path}")
             return None
+
+        if augment:
+            y = augment_audio(y, sr)
+
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmax=8000)
         if mel_spec is None or mel_spec.size == 0:
-            print(f"[Warning] Mel-spectrogram is empty for {file_path}")
             return None
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
 
-        # Normalize per sample
         mean = np.mean(mel_spec_db)
         std = np.std(mel_spec_db)
         mel_spec_db = (mel_spec_db - mean) / (std + 1e-9)
 
-        # Pad/Trim
         pad_width = max(0, max_pad_length - mel_spec_db.shape[1])
         mel_spec_db = np.pad(mel_spec_db, ((0, 0), (0, pad_width)), mode='constant')[:, :max_pad_length]
 
         return mel_spec_db
-    except Exception as e:
-        print(f"[Error] Processing {file_path}: {e}")
+    except Exception:
         return None
 
-def process_audio_file(file_path, max_pad_length=300):
-    return extract_audio_features_librosa(file_path, max_pad_length=max_pad_length)
+def process_audio_file(file_path, max_pad_length=300, augment=False):
+    return extract_audio_features_librosa(file_path, max_pad_length=max_pad_length, augment=augment)
 
-def parallel_extract_audio_features(audio_paths, max_pad_length=300, num_workers=None):
-    process_func = partial(process_audio_file, max_pad_length=max_pad_length)
+def parallel_extract_audio_features(audio_paths, max_pad_length=300, augment=False, num_workers=None):
+    process_func = partial(process_audio_file, max_pad_length=max_pad_length, augment=augment)
     features_list = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         for feat in tqdm(executor.map(process_func, audio_paths), total=len(audio_paths)):
             features_list.append(feat)
 
-    # Filter out None entries
     filtered_features = [f for f in features_list if f is not None]
     if len(filtered_features) < len(features_list):
         print(f"[Warning] Some audio files could not be processed. "
@@ -71,24 +102,27 @@ def parallel_extract_audio_features(audio_paths, max_pad_length=300, num_workers
 #############################################
 # Data Preparation
 #############################################
-def prepare_data(df, max_pad_length=300, fit_scaler=False, scaler=None, genre_encoder=None):
-    audio_paths = [os.path.abspath(preview) for preview in df['audio_previews']]
-    audio_features = parallel_extract_audio_features(audio_paths, max_pad_length=max_pad_length, num_workers=4)
+def filter_top_genres(df, top_n=10):
+    genre_counts = df['genre'].value_counts()
+    top_genres = genre_counts.head(top_n).index
+    df_filtered = df[df['genre'].isin(top_genres)].copy()
+    return df_filtered
+
+def prepare_data(df, scaler, genre_encoder, fit_scaler=False, augment=False):
+    audio_paths = df['audio_previews'].apply(os.path.abspath).to_list()
+    audio_features = parallel_extract_audio_features(audio_paths, max_pad_length=MAX_PAD_LENGTH, augment=augment, num_workers=4)
 
     if audio_features.size == 0:
         raise ValueError("No valid audio features extracted. Check your audio files and paths.")
 
-    # Extract regression labels
     reg_labels = df[['valence_tags', 'arousal_tags', 'dominance_tags']].values
     if fit_scaler:
-        scaler = MinMaxScaler()
         scaler.fit(reg_labels)
     scaled_reg_labels = scaler.transform(reg_labels)
 
-    # Encode genre labels with the pre-fitted encoder
     genre_labels = genre_encoder.transform(df['genre'].astype(str))
 
-    return audio_features, scaled_reg_labels, genre_labels, scaler, genre_encoder
+    return audio_features, scaled_reg_labels, genre_labels
 
 #############################################
 # Model Building
@@ -96,13 +130,18 @@ def prepare_data(df, max_pad_length=300, fit_scaler=False, scaler=None, genre_en
 def build_model(input_shape, num_genres):
     inputs = Input(shape=input_shape)
 
-    # Convolutional Layers
-    x = Conv2D(32, kernel_size=(3,3), padding='same')(inputs)
+    # Convolutional layers
+    x = Conv2D(64, kernel_size=(3,3), padding='same')(inputs)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = MaxPooling2D(pool_size=(2,2))(x)
 
-    x = Conv2D(64, kernel_size=(3,3), padding='same')(x)
+    x = Conv2D(128, kernel_size=(3,3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D(pool_size=(2,2))(x)
+
+    x = Conv2D(128, kernel_size=(3,3), padding='same')(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = MaxPooling2D(pool_size=(2,2))(x)
@@ -114,26 +153,24 @@ def build_model(input_shape, num_genres):
     features = x_shape[2] * x_shape[3]
     x = Reshape((time_steps, features))(x)
 
-    x = Bidirectional(LSTM(64, return_sequences=False, dropout=0.3))(x)
-    x = Dense(128, activation='relu')(x)
+    x = Bidirectional(LSTM(128, return_sequences=False, dropout=0.3))(x)
+    x = Dense(256, activation='relu')(x)
     x = Dropout(0.4)(x)
 
-    # Regression head for valence, arousal, dominance
+    # Regression head
     reg_output = Dense(3, activation='linear', name='reg_output')(x)
 
-    # Classification head for genre
+    # Classification head
     class_output = Dense(num_genres, activation='softmax', name='class_output')(x)
 
     model = Model(inputs, [reg_output, class_output])
-
-    model.compile(optimizer=Adam(learning_rate=1e-4),
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE),
                   loss={'reg_output':'mse', 'class_output':'sparse_categorical_crossentropy'},
                   metrics={'reg_output':['mae'], 'class_output':['accuracy']})
-    model.summary()
     return model
 
 #############################################
-# TensorFlow Dataset Creation
+# TF Dataset Creation
 #############################################
 def create_tf_dataset(features, reg_labels, class_labels, batch_size=32, shuffle=True):
     dataset = tf.data.Dataset.from_tensor_slices((features, {'reg_output': reg_labels, 'class_output': class_labels}))
@@ -158,7 +195,7 @@ def plot_training_history(history, output_path='training_history.png'):
     axes[0].legend()
 
     # Plot regression MAE
-    if 'reg_output_mae' in history_dict and 'val_reg_output_mae' in history_dict:
+    if 'reg_output_mae' in history_dict:
         axes[1].plot(history_dict['reg_output_mae'], label='Train MAE (Reg)')
         axes[1].plot(history_dict['val_reg_output_mae'], label='Val MAE (Reg)')
         axes[1].set_title('Regression MAE')
@@ -167,7 +204,7 @@ def plot_training_history(history, output_path='training_history.png'):
         axes[1].legend()
 
     # Plot classification accuracy
-    if 'class_output_accuracy' in history_dict and 'val_class_output_accuracy' in history_dict:
+    if 'class_output_accuracy' in history_dict:
         axes[2].plot(history_dict['class_output_accuracy'], label='Train Acc (Class)')
         axes[2].plot(history_dict['val_class_output_accuracy'], label='Val Acc (Class)')
         axes[2].set_title('Classification Accuracy')
@@ -180,7 +217,7 @@ def plot_training_history(history, output_path='training_history.png'):
     plt.close()
 
 def plot_confusion_matrix(y_true, y_pred, classes, output_path='confusion_matrix.png'):
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(classes)))
     plt.figure(figsize=(10,7))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
     plt.title('Genre Classification Confusion Matrix')
@@ -193,9 +230,7 @@ def plot_confusion_matrix(y_true, y_pred, classes, output_path='confusion_matrix
 # Main Execution
 #############################################
 if __name__ == "__main__":
-    dataset_path = 'filtered_dataset.csv'
-    max_pad_length = 300
-
+    dataset_path = 'filtered_dataset.csv'  # Ensure this path is correct
     try:
         print("Loading dataset...")
         df = pd.read_csv(dataset_path)
@@ -205,49 +240,44 @@ if __name__ == "__main__":
             if col not in df.columns:
                 raise ValueError(f"Dataset must contain column: {col}")
 
-        # Print raw label stats for regression
-        print("Raw label stats (Regression):")
-        print(df[['valence_tags', 'arousal_tags', 'dominance_tags']].describe())
+        # Filter to top genres
+        df = filter_top_genres(df, top_n=TOP_GENRES)
+        print(f"Dataset filtered to top {TOP_GENRES} genres.")
+        print("Genre counts:")
+        print(df['genre'].value_counts())
 
-        # Fit LabelEncoder on full dataset genres to avoid unseen labels
+        # Fit LabelEncoder on filtered dataset
         genre_encoder = LabelEncoder()
         genre_encoder.fit(df['genre'].astype(str))
-
         unique_genres = genre_encoder.classes_
-        print(f"Number of unique genres: {len(unique_genres)}")
+        num_genres = len(unique_genres)
+        print(f"Number of classes after filtering: {num_genres}")
         print("Genres:", unique_genres)
 
-        # Split dataset
-        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-        train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=42)
+        # Train/Val/Test split
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=SEED)
+        train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=SEED)
 
         print(f"Training samples: {len(train_df)}, Validation samples: {len(val_df)}, Testing samples: {len(test_df)}")
 
-        # Prepare training data
-        X_train, y_train_reg, y_train_genre, scaler, _ = prepare_data(train_df, fit_scaler=True, max_pad_length=max_pad_length, genre_encoder=genre_encoder)
-
-        # Prepare validation data
-        X_val, y_val_reg, y_val_genre, _, _ = prepare_data(val_df, fit_scaler=False, scaler=scaler, genre_encoder=genre_encoder, max_pad_length=max_pad_length)
-
-        # Prepare test data
-        X_test, y_test_reg, y_test_genre, _, _ = prepare_data(test_df, fit_scaler=False, scaler=scaler, genre_encoder=genre_encoder, max_pad_length=max_pad_length)
+        # Prepare data
+        scaler = MinMaxScaler()
+        X_train, y_train_reg, y_train_genre = prepare_data(train_df, scaler, genre_encoder, fit_scaler=True, augment=True)
+        X_val, y_val_reg, y_val_genre = prepare_data(val_df, scaler, genre_encoder, fit_scaler=False, augment=False)
+        X_test, y_test_reg, y_test_genre = prepare_data(test_df, scaler, genre_encoder, fit_scaler=False, augment=False)
 
         # Add channel dimension
         X_train = X_train[..., np.newaxis]
         X_val = X_val[..., np.newaxis]
         X_test = X_test[..., np.newaxis]
 
-        # Create TensorFlow datasets
-        print("Creating TensorFlow datasets...")
-        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre, batch_size=32, shuffle=True)
-        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre, batch_size=32, shuffle=False)
-        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre, batch_size=32, shuffle=False)
+        # Create TF datasets
+        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre, batch_size=BATCH_SIZE, shuffle=True)
+        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre, batch_size=BATCH_SIZE, shuffle=False)
+        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre, batch_size=BATCH_SIZE, shuffle=False)
 
-        # Build the model
-        print("Building the CRNN model...")
-        num_genres = len(unique_genres)
-        input_shape = X_train.shape[1:]
-        model = build_model(input_shape, num_genres)
+        # Build model
+        model = build_model(X_train.shape[1:], num_genres)
 
         # Callbacks
         checkpoint_dir = 'model_checkpoints'
@@ -256,14 +286,14 @@ if __name__ == "__main__":
 
         callbacks = [
             ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_loss', verbose=1),
-            EarlyStopping(monitor='val_loss', patience=10, verbose=1, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1)
+            EarlyStopping(monitor='val_loss', patience=15, verbose=1, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, verbose=1)
         ]
 
         print("Starting training...")
         history = model.fit(
             train_dataset,
-            epochs=50,
+            epochs=EPOCHS,
             validation_data=val_dataset,
             callbacks=callbacks
         )
@@ -278,34 +308,30 @@ if __name__ == "__main__":
         plot_training_history(history, output_path='training_curves.png')
         print("Training curves saved to training_curves.png")
 
-        # Evaluate the model on the test set
+        # Evaluate on test set
         print("Evaluating the model on the test set...")
-        results = model.evaluate(test_dataset)
-        # results: [total_loss, reg_output_loss, class_output_loss, reg_output_mae, class_output_accuracy]
+        results = model.evaluate(test_dataset, verbose=1)
         print("Test Results:", results)
 
         # Predictions on test set
-        y_pred_reg, y_pred_class = model.predict(test_dataset)
-        # Inverse transform regression predictions
+        y_pred_reg, y_pred_class = model.predict(test_dataset, verbose=1)
         y_pred_reg_inv = scaler.inverse_transform(y_pred_reg)
-
-        # Get predicted genres
         y_pred_genre = np.argmax(y_pred_class, axis=1)
 
         # Classification report
         print("Genre Classification Report:")
-        print(classification_report(y_test_genre, y_pred_genre, target_names=unique_genres))
+        print(classification_report(y_test_genre, y_pred_genre, labels=range(num_genres), target_names=unique_genres))
 
-        # Plot confusion matrix
+        # Confusion matrix
         plot_confusion_matrix(y_test_genre, y_pred_genre, classes=unique_genres, output_path='confusion_matrix.png')
         print("Confusion matrix saved to confusion_matrix.png")
 
-        # Save the final model
+        # Save final model
         final_model_path = 'final_multitask_model.keras'
         model.save(final_model_path)
         print(f"Model saved to {final_model_path}")
 
-        # Show some sample predictions
+        # Show sample predictions
         print("Sample predictions on test set:")
         for i in range(min(5, len(y_test_reg))):
             true_reg = scaler.inverse_transform([y_test_reg[i]])
