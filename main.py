@@ -6,18 +6,18 @@ import numpy as np
 import pandas as pd
 import librosa
 import tensorflow as tf
-from tensorflow.keras import backend as K # type: ignore 
-from tensorflow.keras.models import Model # type: ignore
-from tensorflow.keras.layers import ( # type: ignore
+
+# Keras / sklearn / multiprocessing
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
     Dense, Dropout, Input, Conv2D, BatchNormalization, Activation,
     MaxPooling2D, Bidirectional, LSTM, Permute, Reshape
 )
-from tensorflow.keras.optimizers import Adam # type: ignore
-from tensorflow.keras.optimizers.schedules import ExponentialDecay # type: ignore
-from tensorflow.keras.callbacks import ( # type: ignore
-    ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-)
-from tensorflow.keras.regularizers import l2 # type: ignore
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from sklearn.metrics import confusion_matrix, classification_report
@@ -28,27 +28,27 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pickle
 
-# ----------------------------
-# Reproducibility
-# ----------------------------
+# --------------------------------
+# Global Config & Reproducibility
+# --------------------------------
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# ----------------------------
+# --------------------------------
 # Hyperparameters
-# ----------------------------
-MAX_PAD_LENGTH = 300     # number of frames in mel spectrogram
+# --------------------------------
+MAX_PAD_LENGTH = 300     # number of frames in Mel spectrogram
 TOP_GENRES = 10
 BATCH_SIZE = 32
 EPOCHS = 100
 INITIAL_LR = 1e-4        # initial learning rate
 L2_REG = 1e-4            # L2 regularization factor
 
-# ----------------------------
-# Data Augmentation
-# ----------------------------
+# --------------------------------
+# Data Augmentation Helpers
+# --------------------------------
 def augment_audio_waveform(y, sr):
     """
     Augment waveform with random time-stretch, pitch shift, and additive noise.
@@ -74,13 +74,13 @@ def spec_augment(mel_spec_db, num_masks=2,
     augmented = mel_spec_db.copy()
     num_mels, max_frames = augmented.shape
 
-    # Frequency Masking
+    # Frequency masking
     for _ in range(num_masks):
         mask_size = int(freq_masking_max_percentage * num_mels)
         start = np.random.randint(0, num_mels - mask_size)
         augmented[start:start+mask_size, :] = 0
 
-    # Time Masking
+    # Time masking
     for _ in range(num_masks):
         mask_size = int(time_masking_max_percentage * max_frames)
         start = np.random.randint(0, max_frames - mask_size)
@@ -88,21 +88,40 @@ def spec_augment(mel_spec_db, num_masks=2,
 
     return augmented
 
-# ----------------------------
-# Feature Extraction
-# ----------------------------
-def extract_audio_features(file_path, max_pad_length=300, augment=False):
+# --------------------------------
+# Audio Splitting / Chunking
+# --------------------------------
+def split_audio_into_chunks(y, sr, total_duration=30, chunk_duration=5):
     """
-    Load audio, do optional waveform augmentation, compute Mel spectrogram (128xT),
-    normalize, pad, optionally do SpecAugment.
+    Splits the waveform `y` (of length ~ total_duration seconds) into
+    consecutive chunks of `chunk_duration` seconds.
+    
+    Returns a list of waveforms.
+    """
+    max_samples = int(total_duration * sr)
+    y = y[:max_samples]
+
+    chunk_samples = int(chunk_duration * sr)
+    num_chunks = len(y) // chunk_samples  # drop remainder if not a perfect multiple
+
+    segments = []
+    for i in range(num_chunks):
+        start = i * chunk_samples
+        end = start + chunk_samples
+        segments.append(y[start:end])
+    return segments
+
+# --------------------------------
+# Feature Extraction
+# --------------------------------
+def extract_features_from_waveform(y, sr, max_pad_length=300, augment=False):
+    """
+    Given an in-memory waveform y (and sr), compute the Mel-spectrogram features.
+    Returns a (128 x max_pad_length) numpy array or None if something fails.
     """
     try:
-        y, sr = librosa.load(file_path, sr=None, mono=True, duration=30)
-        if y is None or len(y) == 0:
-            return None
-        
         if augment:
-            # Waveform augment
+            # Waveform-level augmentation
             y = augment_audio_waveform(y, sr)
 
         # Compute Mel spectrogram
@@ -134,60 +153,148 @@ def extract_audio_features(file_path, max_pad_length=300, augment=False):
             mel_spec_db = mel_spec_db[:, :max_pad_length]
 
         return mel_spec_db
+
     except Exception:
         return None
 
-def process_audio_file(file_path, max_pad_length=300, augment=False):
-    return extract_audio_features(file_path, max_pad_length=max_pad_length, augment=augment)
+def process_audio_file_to_chunks(file_path,
+                                 total_duration=30,
+                                 chunk_duration=5,
+                                 max_pad_length=300,
+                                 augment=False):
+    """
+    Loads the audio preview (up to `total_duration` seconds).
+    Splits into chunks of `chunk_duration` seconds.
+    Extracts features for each chunk.
+    
+    Returns a list of feature arrays, one per chunk.
+    """
+    try:
+        y, sr = librosa.load(file_path, sr=None, mono=True, duration=total_duration)
+        if y is None or len(y) == 0:
+            return []
 
-def parallel_extract_features(audio_paths, max_pad_length=300, augment=False, num_workers=None):
-    process_func = partial(process_audio_file, max_pad_length=max_pad_length, augment=augment)
-    features_list = []
+        # Split into segments
+        segments = split_audio_into_chunks(
+            y, sr, total_duration=total_duration, chunk_duration=chunk_duration
+        )
+        all_features = []
+
+        for seg in segments:
+            feat = extract_features_from_waveform(
+                seg, sr, max_pad_length=max_pad_length, augment=augment
+            )
+            if feat is not None:
+                all_features.append(feat)
+
+        return all_features
+
+    except Exception:
+        return []
+
+def parallel_extract_features_in_chunks(audio_paths,
+                                        total_duration=30,
+                                        chunk_duration=5,
+                                        max_pad_length=300,
+                                        augment=False,
+                                        num_workers=None):
+    """
+    Extracts features in parallel for each file, where each file
+    can produce multiple chunks.
+    Returns:
+      - A numpy array of shape [N_chunks, 128, max_pad_length]
+      - A list of file indices mapping each chunk back to its file
+    """
+    process_func = partial(
+        process_audio_file_to_chunks,
+        total_duration=total_duration,
+        chunk_duration=chunk_duration,
+        max_pad_length=max_pad_length,
+        augment=augment
+    )
+
+    all_features = []
+    all_file_indices = []
+
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for feat in tqdm(executor.map(process_func, audio_paths), total=len(audio_paths)):
-            features_list.append(feat)
-    # Filter out None
-    filtered_features = [f for f in features_list if f is not None]
-    if len(filtered_features) < len(features_list):
-        print(f"[Warning] Some files failed. Processed {len(filtered_features)} out of {len(features_list)}.")
-    return np.array(filtered_features)
+        results = list(tqdm(executor.map(process_func, audio_paths), total=len(audio_paths)))
 
-# ----------------------------
+    # Flatten the results
+    for file_idx, feats_list in enumerate(results):
+        # feats_list is a list of arrays for each chunk from file_idx
+        for f in feats_list:
+            all_features.append(f)
+            all_file_indices.append(file_idx)
+
+    return np.array(all_features), all_file_indices
+
+# --------------------------------
 # Data Preparation
-# ----------------------------
+# --------------------------------
 def filter_top_genres(df, top_n=TOP_GENRES):
+    """
+    Keep only the top_n most frequent genres in the dataset.
+    """
     genre_counts = df['genre'].value_counts()
     top_genres = genre_counts.head(top_n).index
     df_filtered = df[df['genre'].isin(top_genres)].copy()
     return df_filtered
 
-def prepare_data(df, scaler, genre_encoder, fit_scaler=False, augment=False):
+def prepare_data_with_chunks(df, 
+                             scaler, 
+                             genre_encoder, 
+                             fit_scaler=False, 
+                             augment=False,
+                             total_duration=30,
+                             chunk_duration=5):
+    """
+    Extract chunk-based features from the audio previews in df.
+    Each 30s preview is split into multiple chunks (e.g., 5s each).
+    Returns:
+      - X_list:   np.array of shape [N_chunks, 128, max_pad_length]
+      - y_reg:    np.array of shape [N_chunks, 3]  (scaled V/A/D)
+      - y_genre:  np.array of shape [N_chunks]     (genre indices)
+    """
     audio_paths = df['audio_previews'].apply(os.path.abspath).to_list()
-    X = parallel_extract_features(
-        audio_paths, max_pad_length=MAX_PAD_LENGTH, augment=augment, num_workers=4
+
+    # 1) Extract features in parallel for all chunks
+    X_list, file_indices = parallel_extract_features_in_chunks(
+        audio_paths=audio_paths,
+        total_duration=total_duration,
+        chunk_duration=chunk_duration,
+        max_pad_length=MAX_PAD_LENGTH,
+        augment=augment,
+        num_workers=4
     )
-    if X.size == 0:
+
+    if len(X_list) == 0:
         raise ValueError("No valid audio features extracted.")
 
-    # Regression labels
-    reg_labels = df[['valence_tags', 'arousal_tags', 'dominance_tags']].values
+    # 2) Build the regression labels for each chunk (replicate parent's labels)
+    original_reg_labels = df[['valence_tags', 'arousal_tags', 'dominance_tags']].values
+    chunk_reg_labels = [original_reg_labels[idx] for idx in file_indices]
+    chunk_reg_labels = np.array(chunk_reg_labels)
+
+    # Fit and transform (or just transform) the regression labels
     if fit_scaler:
-        scaler.fit(reg_labels)
-    scaled_reg_labels = scaler.transform(reg_labels)
+        scaler.fit(chunk_reg_labels)
+    scaled_reg_labels = scaler.transform(chunk_reg_labels)
 
-    # Genre labels
-    genre_labels = genre_encoder.transform(df['genre'].astype(str))
-    return X, scaled_reg_labels, genre_labels
+    # 3) Build the genre labels for each chunk
+    original_genre_labels = genre_encoder.transform(df['genre'].astype(str))
+    chunk_genre_labels = [original_genre_labels[idx] for idx in file_indices]
+    chunk_genre_labels = np.array(chunk_genre_labels)
 
-# ----------------------------
+    return X_list, scaled_reg_labels, chunk_genre_labels
+
+# --------------------------------
 # Model Building
-# ----------------------------
+# --------------------------------
 def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     """
     CNN + BiLSTM + Two-task heads (regression + classification).
     Includes dropout, L2 regularization, and a learning rate schedule.
     """
-
     # Learning rate schedule: Exponential Decay
     decay_steps = 1000  # Adjust per dataset size
     decay_rate = 0.9
@@ -200,8 +307,7 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     )
 
     optimizer = Adam(learning_rate=lr_schedule)
-
-    reg = l2(l2_reg)  # L2 regularizer
+    reg = l2(l2_reg)
 
     inputs = Input(shape=input_shape)
 
@@ -219,7 +325,7 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     x = MaxPooling2D(pool_size=(2,2))(x)
     x = Dropout(0.3)(x)
 
-    # Convolutional block 3 (optional: you can remove to reduce complexity)
+    # Convolutional block 3
     x = Conv2D(128, (3,3), padding='same', kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
@@ -257,9 +363,9 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     )
     return model
 
-# ----------------------------
+# --------------------------------
 # TF Dataset Creation
-# ----------------------------
+# --------------------------------
 def create_tf_dataset(X, y_reg, y_class, batch_size=32, shuffle=True):
     dataset = tf.data.Dataset.from_tensor_slices(
         (X, {'reg_output': y_reg, 'class_output': y_class})
@@ -269,9 +375,9 @@ def create_tf_dataset(X, y_reg, y_class, batch_size=32, shuffle=True):
     dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
 
-# ----------------------------
+# --------------------------------
 # Plot Functions
-# ----------------------------
+# --------------------------------
 def plot_training_history(history, output_path='training_history.png'):
     hist = history.history
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -329,9 +435,9 @@ def plot_regression_results(y_true, y_pred, output_path_prefix='regression'):
         ax.scatter(y_true[:, i], y_pred[:, i], alpha=0.5)
         ax.set_xlabel(f"True {target_names[i]}")
         ax.set_ylabel(f"Predicted {target_names[i]}")
-        ax.set_title(f"{target_names[i]}: Predicted vs True")
+        ax.set_title(f"{target_names[i]}: Predicted vs. True")
 
-        # If you want a diagonal reference line
+        # Diagonal reference line
         min_val = min(y_true[:, i].min(), y_pred[:, i].min())
         max_val = max(y_true[:, i].max(), y_pred[:, i].max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--')
@@ -340,11 +446,11 @@ def plot_regression_results(y_true, y_pred, output_path_prefix='regression'):
     plt.savefig(f"{output_path_prefix}_scatter.png")
     plt.close()
 
-# ----------------------------
+# --------------------------------
 # Main Execution
-# ----------------------------
+# --------------------------------
 if __name__ == "__main__":
-    dataset_path = 'filtered_dataset.csv'  # replace with your CSV path
+    dataset_path = 'filtered_dataset.csv'  # Replace with your CSV path
 
     try:
         print("Loading dataset...")
@@ -374,11 +480,22 @@ if __name__ == "__main__":
         train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=SEED)
         print(f"Train samples: {len(train_df)}, Val samples: {len(val_df)}, Test samples: {len(test_df)}")
 
-        # Prepare Data
+        # Prepare Data (with chunking)
         scaler = MinMaxScaler()
-        X_train, y_train_reg, y_train_genre = prepare_data(train_df, scaler, genre_encoder, fit_scaler=True, augment=True)
-        X_val, y_val_reg, y_val_genre = prepare_data(val_df, scaler, genre_encoder, fit_scaler=False, augment=False)
-        X_test, y_test_reg, y_test_genre = prepare_data(test_df, scaler, genre_encoder, fit_scaler=False, augment=False)
+
+        # Here we chunk each 30s preview into multiple 5s segments for training
+        X_train, y_train_reg, y_train_genre = prepare_data_with_chunks(
+            train_df, scaler, genre_encoder, fit_scaler=True, augment=True,
+            total_duration=30, chunk_duration=5
+        )
+        X_val, y_val_reg, y_val_genre = prepare_data_with_chunks(
+            val_df, scaler, genre_encoder, fit_scaler=False, augment=False,
+            total_duration=30, chunk_duration=5
+        )
+        X_test, y_test_reg, y_test_genre = prepare_data_with_chunks(
+            test_df, scaler, genre_encoder, fit_scaler=False, augment=False,
+            total_duration=30, chunk_duration=5
+        )
 
         # Add channel dimension
         X_train = X_train[..., np.newaxis]
@@ -386,12 +503,18 @@ if __name__ == "__main__":
         X_test = X_test[..., np.newaxis]
 
         # Create TF Datasets
-        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre, batch_size=BATCH_SIZE, shuffle=True)
-        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre, batch_size=BATCH_SIZE, shuffle=False)
-        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre, batch_size=BATCH_SIZE, shuffle=False)
+        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre,
+                                          batch_size=BATCH_SIZE, shuffle=True)
+        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre,
+                                        batch_size=BATCH_SIZE, shuffle=False)
+        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre,
+                                         batch_size=BATCH_SIZE, shuffle=False)
 
-        # Build and Compile Model
-        model = build_model(input_shape=X_train.shape[1:], num_genres=num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR)
+        # Build and compile the model
+        model = build_model(input_shape=X_train.shape[1:],
+                            num_genres=num_genres,
+                            l2_reg=L2_REG,
+                            initial_lr=INITIAL_LR)
         model.summary()
 
         # Callbacks
@@ -402,8 +525,6 @@ if __name__ == "__main__":
         callbacks = [
             ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_loss', verbose=1),
             EarlyStopping(monitor='val_loss', patience=15, verbose=1, restore_best_weights=True),
-            # You can choose between ReduceLROnPlateau or rely solely on ExponentialDecay
-            # If you want both, keep in mind they can conflict. For demonstration, let's keep it:
             ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, verbose=1)
         ]
 
@@ -430,11 +551,12 @@ if __name__ == "__main__":
         print("Test Results:", test_results)
 
         # Predictions on test set
+        print("\nPredicting on test set...")
         y_pred_reg, y_pred_class = model.predict(test_dataset, verbose=1)
         y_pred_reg_inv = scaler.inverse_transform(y_pred_reg)  # invert scaling
         y_pred_genre = np.argmax(y_pred_class, axis=1)
 
-        # Regression Scatter Plots
+        # Plot regression results
         plot_regression_results(y_test_reg, y_pred_reg_inv, output_path_prefix='regression')
         print("Regression scatter plots saved (regression_scatter.png)")
 
@@ -453,16 +575,30 @@ if __name__ == "__main__":
         model.save(final_model_path)
         print(f"Model saved to {final_model_path}")
 
-        # Show sample predictions
-        print("\nSample predictions on test set:")
+        # Sample predictions with top 3 genres
+        print("\nSample predictions on test set (showing top 3 genres):")
         for i in range(min(5, len(y_test_reg))):
-            true_reg = scaler.inverse_transform([y_test_reg[i]])
+            true_reg = scaler.inverse_transform([y_test_reg[i]])[0]
             pred_reg = y_pred_reg_inv[i]
+
             true_genre = unique_genres[y_test_genre[i]]
-            pred_genre = unique_genres[y_pred_genre[i]]
+
+            # Argmax-based predicted genre
+            pred_genre_argmax = unique_genres[y_pred_genre[i]]
+
+            # Sort probabilities for top-k
+            pred_probs = y_pred_class[i]
+            sorted_idx = np.argsort(pred_probs)[::-1]
+            top_3_idx = sorted_idx[:3]
+
             print(f"  Sample {i}:")
-            print(f"    True V/A/D: {true_reg[0]} | Predicted V/A/D: {pred_reg}")
-            print(f"    True Genre: {true_genre} | Predicted Genre: {pred_genre}")
+            print(f"    True V/A/D:  {true_reg}")
+            print(f"    Pred V/A/D:  {pred_reg}")
+            print(f"    True Genre:  {true_genre}")
+            print(f"    Top predicted genres:")
+            for rank, genre_id in enumerate(top_3_idx, start=1):
+                confidence = pred_probs[genre_id]
+                print(f"      {rank}) {unique_genres[genre_id]} (confidence={confidence:.4f})")
 
     except Exception as e:
         print(f"Error during training: {e}")
