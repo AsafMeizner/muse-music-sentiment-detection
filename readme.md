@@ -6,7 +6,30 @@ This project implements a **multi-task** deep learning model that:
 
 ---
 
-## **1. Data Preparation**
+## **1. Data Explanation**
+
+I use the **MUSE** dataset, which has approximately 4000 songs. Each entry in the dataset contains:
+
+- **lastfm_url**: A reference URL on Last.fm.  
+- **track**: The track title.  
+- **artist**: The artist name.  
+- **seeds**: A list of descriptive emotional tags, e.g., `['aggressive', 'fun']`.  
+- **number_of_emotion_tags**: How many emotion tags were applied.  
+- **valence_tags**, **arousal_tags**, **dominance_tags**: Numerical values indicating each dimension of emotion for the track.  
+- **mbid**: MusicBrainz ID for the track.  
+- **spotify_id**: Spotify track ID.  
+- **genre**: The top-level genre classification for the track.  
+- **audio_previews**: A local path or filename to the 30-second audio clip (`.mp3`) for that track.
+
+Example rows:
+| lastfm_url                                                                 | track      | artist | seeds                                 | number_of_emotion_tags | valence_tags      | arousal_tags     | dominance_tags    | mbid                                 | spotify_id                      | genre    | audio_previews                                |
+|---------------------------------------------------------------------------|------------|--------|---------------------------------------|------------------------|-------------------|------------------|-------------------|--------------------------------------|----------------------------------|----------|-----------------------------------------------|
+| [Bamboo Banga](https://www.last.fm/music/m.i.a./_/bamboo%2bbanga)          | Bamboo Banga | M.I.A. | `['aggressive', 'fun', 'sexy', 'energetic']` | 13                     | 6.555071428571428 | 5.537214285714287 | 5.691357142857143 | 99dd2c8c-e7c1-413e-8ea4-4497a00ffa18 | 6tqFC1DIOphJkCwrjVzPmg          | hip-hop  | [Audio Preview](audio_previews\6tqFC1DIOphJkCwrjVzPmg.mp3) |
+| [Die MF Die](https://www.last.fm/music/dope/_/die%2bmf%2bdie)              | Die MF Die | Dope   | `['aggressive']`                      | 7                      | 3.771176470588235 | 5.348235294117648 | 5.441764705882353 | b9eb3484-5e0e-4690-ab5a-ca91937032a5 | 5bU4KX47KqtDKKaLM4QCzh          | metal    | [Audio Preview](audio_previews\5bU4KX47KqtDKKaLM4QCzh.mp3) |
+
+---
+
+## **2. Data Preparation**
 
 1. **Chunking (5s each)**  
    - Split each 30s preview into multiple 5s segments to increase sample diversity.
@@ -29,10 +52,9 @@ This project implements a **multi-task** deep learning model that:
 
 ---
 
+## **3. Model Architecture**
 
-## **2. Model Architecture**
-
-The architecture is using **CRNN** and comprises:
+The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) and comprises:
 
 **Input Layer**  
 - Shape: `[128, 300, 1]` (Mel-spectrogram with 1 channel)
@@ -77,7 +99,7 @@ The architecture is using **CRNN** and comprises:
 
 ---
 
-## **3. Technologies Used**
+## **4. Technologies Used**
 
 - **TensorFlow/Keras** for the core deep learning model.
 - **Librosa** for audio loading and Mel-spectrogram extraction.
@@ -88,30 +110,35 @@ The architecture is using **CRNN** and comprises:
 
 ---
 
-## **4. Training**
+## **5. Training**
 
 - **Loss Functions**  
   - **Mean Squared Error (MSE)** for the regression head.  
   - **Sparse Categorical Crossentropy** for the classification head.
-- **Optimizer**: **Adam** with an **Exponential Decay** learning rate schedule.
-- **Callbacks**:  
+
+- **Optimizer**  
+  - **Adam** with an **Exponential Decay** learning rate schedule.
+
+- **Callbacks**  
   - **EarlyStopping** (to stop training if val loss stops improving).  
   - **ModelCheckpoint** (to save the best weights).  
   - **ReduceLROnPlateau** (to lower learning rate when training plateaus).
 
 ---
 
-## **5. Results**
+## **6. Results**
 
 1. **Regression**  
    - Evaluated with **Mean Absolute Error** (MAE) on valence, arousal, and dominance.
+
 2. **Classification**  
    - **Genre** accuracy and detailed classification report (precision, recall, F1).
+
 3. **Top-K Predictions**  
    - We can retrieve the top 3 most likely genres per track from the softmax output.
 
 ---
 
-## **6. Summary**
+## **7. Summary**
 
 This model combines **CNN**-based feature extraction with a **BiLSTM** for temporal context, ending in two separate heads for **emotion regression** and **genre classification**. By chunking audio and applying augmentations, the model learns robust representations that help it excel at both continuous (V/A/D) and categorical (genre) tasks.
