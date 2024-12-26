@@ -8,18 +8,19 @@ import librosa
 import tensorflow as tf
 
 # Keras / sklearn / multiprocessing
-from tensorflow.keras import backend as K
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
+from tensorflow.keras import backend as K # type: ignore
+from tensorflow.keras.models import Model # type: ignore
+from tensorflow.keras.layers import ( # type: ignore
     Dense, Dropout, Input, Conv2D, BatchNormalization, Activation,
     MaxPooling2D, Bidirectional, LSTM, Permute, Reshape
 )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.optimizers.schedules import ExponentialDecay
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import Adam # type: ignore
+from tensorflow.keras.optimizers.schedules import ExponentialDecay # type: ignore
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau # type: ignore
+from tensorflow.keras.regularizers import l2 # type: ignore
+
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder, MultiLabelBinarizer
 from sklearn.metrics import confusion_matrix, classification_report
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
@@ -102,7 +103,7 @@ def split_audio_into_chunks(y, sr, total_duration=30, chunk_duration=5):
     y = y[:max_samples]
 
     chunk_samples = int(chunk_duration * sr)
-    num_chunks = len(y) // chunk_samples  # drop remainder if not a perfect multiple
+    num_chunks = len(y) // chunk_samples  # drop remainder
 
     segments = []
     for i in range(num_chunks):
@@ -143,7 +144,7 @@ def extract_features_from_waveform(y, sr, max_pad_length=300, augment=False):
         if augment:
             mel_spec_db = spec_augment(mel_spec_db)
 
-        # Pad or truncate
+        # Pad or truncate to fixed length
         pad_width = max_pad_length - mel_spec_db.shape[1]
         if pad_width > 0:
             mel_spec_db = np.pad(
@@ -174,7 +175,6 @@ def process_audio_file_to_chunks(file_path,
         if y is None or len(y) == 0:
             return []
 
-        # Split into segments
         segments = split_audio_into_chunks(
             y, sr, total_duration=total_duration, chunk_duration=chunk_duration
         )
@@ -221,7 +221,6 @@ def parallel_extract_features_in_chunks(audio_paths,
 
     # Flatten the results
     for file_idx, feats_list in enumerate(results):
-        # feats_list is a list of arrays for each chunk from file_idx
         for f in feats_list:
             all_features.append(f)
             all_file_indices.append(file_idx)
@@ -243,17 +242,18 @@ def filter_top_genres(df, top_n=TOP_GENRES):
 def prepare_data_with_chunks(df, 
                              scaler, 
                              genre_encoder, 
+                             seed_binarizer,
                              fit_scaler=False, 
                              augment=False,
                              total_duration=30,
                              chunk_duration=5):
     """
     Extract chunk-based features from the audio previews in df.
-    Each 30s preview is split into multiple chunks (e.g., 5s each).
     Returns:
-      - X_list:   np.array of shape [N_chunks, 128, max_pad_length]
-      - y_reg:    np.array of shape [N_chunks, 3]  (scaled V/A/D)
-      - y_genre:  np.array of shape [N_chunks]     (genre indices)
+      - X_list:        np.array of shape [N_chunks, 128, max_pad_length]
+      - y_reg:         np.array of shape [N_chunks, 3]
+      - y_genre:       np.array of shape [N_chunks]
+      - y_seed_multi:  np.array of shape [N_chunks, n_seed_tokens]
     """
     audio_paths = df['audio_previews'].apply(os.path.abspath).to_list()
 
@@ -275,28 +275,38 @@ def prepare_data_with_chunks(df,
     chunk_reg_labels = [original_reg_labels[idx] for idx in file_indices]
     chunk_reg_labels = np.array(chunk_reg_labels)
 
-    # Fit and transform (or just transform) the regression labels
+    # Fit/transform the regression labels
     if fit_scaler:
         scaler.fit(chunk_reg_labels)
     scaled_reg_labels = scaler.transform(chunk_reg_labels)
 
-    # 3) Build the genre labels for each chunk
+    # 3) Genre labels for each chunk
     original_genre_labels = genre_encoder.transform(df['genre'].astype(str))
     chunk_genre_labels = [original_genre_labels[idx] for idx in file_indices]
     chunk_genre_labels = np.array(chunk_genre_labels)
 
-    return X_list, scaled_reg_labels, chunk_genre_labels
+    # 4) Seed multi-label encoding for each chunk
+    #    For each track, replicate its multi-hot seed vector
+    original_seeds = seed_binarizer.transform(df['seeds'])  
+    # seeds is assumed to be a list of strings in each row, e.g. ['aggressive','fun']
+    chunk_seed_labels = [original_seeds[idx] for idx in file_indices]
+    chunk_seed_labels = np.array(chunk_seed_labels)
+
+    return X_list, scaled_reg_labels, chunk_genre_labels, chunk_seed_labels
 
 # --------------------------------
 # Model Building
 # --------------------------------
-def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
+def build_model(input_shape, 
+                num_genres, 
+                num_seed_tokens,
+                l2_reg=L2_REG, 
+                initial_lr=INITIAL_LR):
     """
-    CNN + BiLSTM + Two-task heads (regression + classification).
-    Includes dropout, L2 regularization, and a learning rate schedule.
+    CNN + BiLSTM + Three-task heads (regression + genre classification + seed multi-label).
     """
-    # Learning rate schedule: Exponential Decay
-    decay_steps = 1000  # Adjust per dataset size
+    # Learning rate schedule
+    decay_steps = 1000  # Adjust for your dataset size
     decay_rate = 0.9
     staircase = True
     lr_schedule = ExponentialDecay(
@@ -333,7 +343,7 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     x = Dropout(0.3)(x)
 
     # Reshape for LSTM
-    x = Permute((2, 1, 3))(x)  # [batch, freq, time, channels] -> [batch, time, freq, channels]
+    x = Permute((2, 1, 3))(x)  
     time_steps = x.shape[1]
     features = x.shape[2] * x.shape[3]
     x = Reshape((time_steps, features))(x)
@@ -343,22 +353,27 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
     x = Dense(256, activation='relu', kernel_regularizer=reg)(x)
     x = Dropout(0.4)(x)
 
-    # Regression head
+    # 1) Regression head (Valence/Arousal/Dominance)
     reg_output = Dense(3, activation='linear', name='reg_output')(x)
 
-    # Classification head
+    # 2) Genre classification head
     class_output = Dense(num_genres, activation='softmax', name='class_output')(x)
 
-    model = Model(inputs, [reg_output, class_output])
+    # 3) Seeds multi-label head
+    seed_output = Dense(num_seed_tokens, activation='sigmoid', name='seed_output')(x)
+
+    model = Model(inputs, [reg_output, class_output, seed_output])
     model.compile(
         optimizer=optimizer,
         loss={
             'reg_output': 'mse',
-            'class_output': 'sparse_categorical_crossentropy'
+            'class_output': 'sparse_categorical_crossentropy',
+            'seed_output': 'binary_crossentropy'
         },
         metrics={
             'reg_output': ['mae'],
-            'class_output': ['accuracy']
+            'class_output': ['accuracy'],
+            'seed_output': ['binary_accuracy']  # or other metrics
         }
     )
     return model
@@ -366,9 +381,19 @@ def build_model(input_shape, num_genres, l2_reg=L2_REG, initial_lr=INITIAL_LR):
 # --------------------------------
 # TF Dataset Creation
 # --------------------------------
-def create_tf_dataset(X, y_reg, y_class, batch_size=32, shuffle=True):
+def create_tf_dataset(X, y_reg, y_class, y_seeds, batch_size=32, shuffle=True):
+    """
+    We now have three outputs:
+      reg_output   -> shape (None, 3)
+      class_output -> shape (None,)
+      seed_output  -> shape (None, n_seed_tokens)
+    """
     dataset = tf.data.Dataset.from_tensor_slices(
-        (X, {'reg_output': y_reg, 'class_output': y_class})
+        (X, {
+            'reg_output': y_reg,
+            'class_output': y_class,
+            'seed_output': y_seeds
+        })
     )
     if shuffle:
         dataset = dataset.shuffle(buffer_size=len(X))
@@ -376,7 +401,7 @@ def create_tf_dataset(X, y_reg, y_class, batch_size=32, shuffle=True):
     return dataset
 
 # --------------------------------
-# Plot Functions
+# Plot Functions (unchanged)
 # --------------------------------
 def plot_training_history(history, output_path='training_history.png'):
     hist = history.history
@@ -424,10 +449,6 @@ def plot_confusion_matrix(y_true, y_pred, classes, output_path='confusion_matrix
     plt.close()
 
 def plot_regression_results(y_true, y_pred, output_path_prefix='regression'):
-    """
-    Plot predicted vs. actual for the 3 regression targets:
-    valence, arousal, dominance.
-    """
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     target_names = ['Valence', 'Arousal', 'Dominance']
 
@@ -437,7 +458,6 @@ def plot_regression_results(y_true, y_pred, output_path_prefix='regression'):
         ax.set_ylabel(f"Predicted {target_names[i]}")
         ax.set_title(f"{target_names[i]}: Predicted vs. True")
 
-        # Diagonal reference line
         min_val = min(y_true[:, i].min(), y_pred[:, i].min())
         max_val = max(y_true[:, i].max(), y_pred[:, i].max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--')
@@ -456,10 +476,16 @@ if __name__ == "__main__":
         print("Loading dataset...")
         df = pd.read_csv(dataset_path)
 
-        required_cols = ['audio_previews', 'valence_tags', 'arousal_tags', 'dominance_tags', 'genre']
+        required_cols = ['audio_previews', 'valence_tags', 'arousal_tags', 
+                         'dominance_tags', 'genre', 'seeds']
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Missing column: {c}")
+
+        # Convert seeds from string to list if needed
+        # If your CSV already has them as lists, skip this step
+        # For example, if seeds are stored like "['aggressive','fun']" in CSV:
+        #   df['seeds'] = df['seeds'].apply(lambda x: eval(x) if isinstance(x, str) else x)
 
         # Filter top genres
         df = filter_top_genres(df, top_n=TOP_GENRES)
@@ -475,6 +501,15 @@ if __name__ == "__main__":
         print(f"Number of genres: {num_genres}")
         print("Genres:", unique_genres)
 
+        # MultiLabelBinarizer for seeds
+        # Gather all unique seeds across the dataset
+        seed_binarizer = MultiLabelBinarizer()
+        seed_binarizer.fit(df['seeds'])
+        seed_token_classes = seed_binarizer.classes_
+        num_seed_tokens = len(seed_token_classes)
+        print(f"Number of unique seed tokens: {num_seed_tokens}")
+        print("Seed tokens:", seed_token_classes)
+
         # Train/Val/Test Split
         train_df, test_df = train_test_split(df, test_size=0.2, random_state=SEED)
         train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=SEED)
@@ -483,36 +518,40 @@ if __name__ == "__main__":
         # Prepare Data (with chunking)
         scaler = MinMaxScaler()
 
-        # Here we chunk each 30s preview into multiple 5s segments for training
-        X_train, y_train_reg, y_train_genre = prepare_data_with_chunks(
-            train_df, scaler, genre_encoder, fit_scaler=True, augment=True,
+        # Here we chunk each 30s preview into multiple 5s segments
+        X_train, y_train_reg, y_train_genre, y_train_seeds = prepare_data_with_chunks(
+            train_df, scaler, genre_encoder, seed_binarizer,
+            fit_scaler=True, augment=True,
             total_duration=30, chunk_duration=5
         )
-        X_val, y_val_reg, y_val_genre = prepare_data_with_chunks(
-            val_df, scaler, genre_encoder, fit_scaler=False, augment=False,
+        X_val, y_val_reg, y_val_genre, y_val_seeds = prepare_data_with_chunks(
+            val_df, scaler, genre_encoder, seed_binarizer,
+            fit_scaler=False, augment=False,
             total_duration=30, chunk_duration=5
         )
-        X_test, y_test_reg, y_test_genre = prepare_data_with_chunks(
-            test_df, scaler, genre_encoder, fit_scaler=False, augment=False,
+        X_test, y_test_reg, y_test_genre, y_test_seeds = prepare_data_with_chunks(
+            test_df, scaler, genre_encoder, seed_binarizer,
+            fit_scaler=False, augment=False,
             total_duration=30, chunk_duration=5
         )
 
-        # Add channel dimension
+        # Add channel dimension to X
         X_train = X_train[..., np.newaxis]
         X_val = X_val[..., np.newaxis]
         X_test = X_test[..., np.newaxis]
 
         # Create TF Datasets
-        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre,
+        train_dataset = create_tf_dataset(X_train, y_train_reg, y_train_genre, y_train_seeds,
                                           batch_size=BATCH_SIZE, shuffle=True)
-        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre,
+        val_dataset = create_tf_dataset(X_val, y_val_reg, y_val_genre, y_val_seeds,
                                         batch_size=BATCH_SIZE, shuffle=False)
-        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre,
+        test_dataset = create_tf_dataset(X_test, y_test_reg, y_test_genre, y_test_seeds,
                                          batch_size=BATCH_SIZE, shuffle=False)
 
         # Build and compile the model
         model = build_model(input_shape=X_train.shape[1:],
                             num_genres=num_genres,
+                            num_seed_tokens=num_seed_tokens,
                             l2_reg=L2_REG,
                             initial_lr=INITIAL_LR)
         model.summary()
@@ -552,53 +591,84 @@ if __name__ == "__main__":
 
         # Predictions on test set
         print("\nPredicting on test set...")
-        y_pred_reg, y_pred_class = model.predict(test_dataset, verbose=1)
-        y_pred_reg_inv = scaler.inverse_transform(y_pred_reg)  # invert scaling
+        y_pred_reg, y_pred_class, y_pred_seeds = model.predict(test_dataset, verbose=1)
+
+        # 1) Regression - invert MinMax scaling
+        y_pred_reg_inv = scaler.inverse_transform(y_pred_reg)
+
+        # 2) Genre classification
         y_pred_genre = np.argmax(y_pred_class, axis=1)
+
+        # 3) Seeds multi-label
+        #    For each example, we have a probability distribution over possible seeds
+        #    You can choose a threshold (e.g. 0.5) to decide which seeds are “predicted.”
+        seed_threshold = 0.5
+        y_pred_seeds_bin = (y_pred_seeds >= seed_threshold).astype(int)
 
         # Plot regression results
         plot_regression_results(y_test_reg, y_pred_reg_inv, output_path_prefix='regression')
         print("Regression scatter plots saved (regression_scatter.png)")
 
-        # Classification Report
+        # Genre Classification Report
         print("\nGenre Classification Report:")
         print(classification_report(
-            y_test_genre, y_pred_genre, labels=range(num_genres), target_names=unique_genres
+            y_test_genre, 
+            y_pred_genre, 
+            labels=range(num_genres), 
+            target_names=unique_genres
         ))
 
         # Confusion Matrix
         plot_confusion_matrix(y_test_genre, y_pred_genre, unique_genres, 'confusion_matrix.png')
         print("Confusion matrix saved to confusion_matrix.png")
 
+        # (Optional) Evaluate seeds in some multi-label metric (e.g., F1)
+        # from sklearn.metrics import classification_report
+        # Because it's multi-label, you'd do something like:
+        #   print("Seeds multi-label classification report:")
+        #   print(classification_report(y_test_seeds, y_pred_seeds_bin, target_names=seed_token_classes))
+        # or use other specialized multi-label metrics.
+
         # Save final model
-        final_model_path = 'final_multitask_model.keras'
+        final_model_path = 'final_multitask_model_with_seeds.keras'
         model.save(final_model_path)
         print(f"Model saved to {final_model_path}")
 
-        # Sample predictions with top 3 genres
-        print("\nSample predictions on test set (showing top 3 genres):")
+        # Sample predictions with top 3 genres and some seeds
+        print("\nSample predictions on test set (showing top 3 genres + seed predictions):")
+        test_x = np.array(X_test)
         for i in range(min(5, len(y_test_reg))):
             true_reg = scaler.inverse_transform([y_test_reg[i]])[0]
             pred_reg = y_pred_reg_inv[i]
 
             true_genre = unique_genres[y_test_genre[i]]
-
-            # Argmax-based predicted genre
             pred_genre_argmax = unique_genres[y_pred_genre[i]]
 
-            # Sort probabilities for top-k
-            pred_probs = y_pred_class[i]
-            sorted_idx = np.argsort(pred_probs)[::-1]
-            top_3_idx = sorted_idx[:3]
+            # Sort probabilities for top-3
+            pred_probs_genres = y_pred_class[i]
+            sorted_idx_genres = np.argsort(pred_probs_genres)[::-1]
+            top_3_idx = sorted_idx_genres[:3]
+
+            # Seeds
+            true_seeds_multi = np.where(y_test_seeds[i] == 1)[0]
+            pred_seeds_multi = np.where(y_pred_seeds_bin[i] == 1)[0]
+            # Convert to actual token names
+            true_seeds_tokens = [seed_token_classes[idx] for idx in true_seeds_multi]
+            pred_seeds_tokens = [seed_token_classes[idx] for idx in pred_seeds_multi]
 
             print(f"  Sample {i}:")
             print(f"    True V/A/D:  {true_reg}")
             print(f"    Pred V/A/D:  {pred_reg}")
+
             print(f"    True Genre:  {true_genre}")
-            print(f"    Top predicted genres:")
-            for rank, genre_id in enumerate(top_3_idx, start=1):
-                confidence = pred_probs[genre_id]
-                print(f"      {rank}) {unique_genres[genre_id]} (confidence={confidence:.4f})")
+            print("    Top predicted genres:")
+            for rank, g_idx in enumerate(top_3_idx, start=1):
+                confidence = pred_probs_genres[g_idx]
+                print(f"      {rank}) {unique_genres[g_idx]} (conf={confidence:.4f})")
+
+            print(f"    True Seeds:  {true_seeds_tokens}")
+            print(f"    Pred Seeds:  {pred_seeds_tokens}")
+            print()
 
     except Exception as e:
         print(f"Error during training: {e}")

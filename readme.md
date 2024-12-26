@@ -1,8 +1,9 @@
-# Multi-Task Music Emotion & Genre Model
+# Multi-Task Music Emotion, Genre, & Seed Model
 
 This project implements a **multi-task** deep learning model that:
-1. **Classifies** music tracks into one of several top genres.
-2. **Regresses** three continuous emotional dimensions: **Valence**, **Arousal**, and **Dominance**.
+1. **Classifies** music tracks into one of several top genres.  
+2. **Regresses** three continuous emotional dimensions: **Valence**, **Arousal**, and **Dominance**.  
+3. **Predicts** a **multi-label** set of emotional **seed** tags.
 
 ---
 
@@ -22,17 +23,18 @@ I use the **MUSE** dataset, which has approximately 4000 songs. Each entry in th
 - **audio_previews**: A local path or filename to the 30-second audio clip (`.mp3`) for that track.
 
 Example rows:
-| lastfm_url                                                                 | track      | artist | seeds                                 | number_of_emotion_tags | valence_tags      | arousal_tags     | dominance_tags    | mbid                                 | spotify_id                      | genre    | audio_previews                                |
-|---------------------------------------------------------------------------|------------|--------|---------------------------------------|------------------------|-------------------|------------------|-------------------|--------------------------------------|----------------------------------|----------|-----------------------------------------------|
-| [Bamboo Banga](https://www.last.fm/music/m.i.a./_/bamboo%2bbanga)          | Bamboo Banga | M.I.A. | `['aggressive', 'fun', 'sexy', 'energetic']` | 13                     | 6.555071428571428 | 5.537214285714287 | 5.691357142857143 | 99dd2c8c-e7c1-413e-8ea4-4497a00ffa18 | 6tqFC1DIOphJkCwrjVzPmg          | hip-hop  | [Audio Preview](audio_previews\6tqFC1DIOphJkCwrjVzPmg.mp3) |
-| [Die MF Die](https://www.last.fm/music/dope/_/die%2bmf%2bdie)              | Die MF Die | Dope   | `['aggressive']`                      | 7                      | 3.771176470588235 | 5.348235294117648 | 5.441764705882353 | b9eb3484-5e0e-4690-ab5a-ca91937032a5 | 5bU4KX47KqtDKKaLM4QCzh          | metal    | [Audio Preview](audio_previews\5bU4KX47KqtDKKaLM4QCzh.mp3) |
+
+| lastfm_url                                                                 | track       | artist | seeds                                     | number_of_emotion_tags | valence_tags      | arousal_tags     | dominance_tags    | mbid                                 | spotify_id                  | genre   | audio_previews                                  |
+|----------------------------------------------------------------------------|-------------|--------|-------------------------------------------|------------------------|-------------------|------------------|-------------------|----------------------------------------|----------------------------|---------|-------------------------------------------------|
+| [Bamboo Banga](https://www.last.fm/music/m.i.a./_/bamboo%2bbanga)          | Bamboo Banga | M.I.A. | `['aggressive', 'fun', 'sexy', 'energetic']` | 13                     | 6.555071428571428 | 5.537214285714287 | 5.691357142857143 | 99dd2c8c-e7c1-413e-8ea4-4497a00ffa18   | 6tqFC1DIOphJkCwrjVzPmg      | hip-hop | [Audio Preview](audio_previews\6tqFC1DIOphJkCwrjVzPmg.mp3) |
+| [Die MF Die](https://www.last.fm/music/dope/_/die%2bmf%2bdie)              | Die MF Die   | Dope   | `['aggressive']`                          | 7                      | 3.771176470588235 | 5.348235294117648 | 5.441764705882353 | b9eb3484-5e0e-4690-ab5a-ca91937032a5   | 5bU4KX47KqtDKKaLM4QCzh      | metal   | [Audio Preview](audio_previews\5bU4KX47KqtDKKaLM4QCzh.mp3) |
 
 ---
 
 ## **2. Data Preparation**
 
 1. **Chunking (5s each)**  
-   - Split each 30s preview into multiple 5s segments to increase sample diversity.
+   - Each 30s preview is split into multiple 5s segments to increase sample diversity.
 
 2. **Waveform Augmentation** (Training Only)  
    - Random **time-stretch**, **pitch shift**, and **additive noise** to improve robustness.
@@ -48,13 +50,14 @@ Example rows:
 
 6. **Label Encoding**  
    - **Regression**: V/A/D values (scaled to `[0, 1]`).  
-   - **Genre**: Top genres encoded via a label encoder.
+   - **Genre**: Top genres encoded via a label encoder.  
+   - **Seed Tags**: Multi-label binarization (each seed token → a position in a multi-hot vector).
 
 ---
 
 ## **3. Model Architecture**
 
-The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) and comprises:
+The architecture is a **CRNN** (Convolutional Recurrent Neural Network) with **three** heads:
 
 **Input Layer**  
 - Shape: `[128, 300, 1]` (Mel-spectrogram with 1 channel)
@@ -93,9 +96,11 @@ The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) an
 
 **Multi-Task Outputs**  
 1. **Regression Head**: `Dense(3, activation='linear', name='reg_output')`  
-   - Predicts **Valence, Arousal, Dominance**  
-2. **Classification Head**: `Dense(num_genres, activation='softmax', name='class_output')`  
-   - Predicts **Genre** probabilities
+   - Predicts **Valence, Arousal, Dominance**.  
+2. **Genre Classification Head**: `Dense(num_genres, activation='softmax', name='class_output')`  
+   - Predicts **Genre** probabilities.  
+3. **Seeds Multi-Label Head**: `Dense(num_seed_tokens, activation='sigmoid', name='seed_output')`  
+   - Predicts a **multi-hot** vector over seed tags.
 
 ---
 
@@ -103,8 +108,8 @@ The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) an
 
 - **TensorFlow/Keras** for the core deep learning model.
 - **Librosa** for audio loading and Mel-spectrogram extraction.
-- **scikit-learn** for label encoding and scaling (MinMaxScaler).
-- **pandas, numpy** for data handling and array ops.
+- **scikit-learn** for label encoding, scaling (MinMaxScaler), and **multi-label binarization** (MultiLabelBinarizer).
+- **pandas, numpy** for data handling and array operations.
 - **matplotlib, seaborn** for plots (e.g., confusion matrix, scatter plots).
 - **tqdm** for progress bars during feature extraction.
 
@@ -114,7 +119,8 @@ The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) an
 
 - **Loss Functions**  
   - **Mean Squared Error (MSE)** for the regression head.  
-  - **Sparse Categorical Crossentropy** for the classification head.
+  - **Sparse Categorical Crossentropy** for the genre classification head.  
+  - **Binary Crossentropy** for the seeds multi-label head.
 
 - **Optimizer**  
   - **Adam** with an **Exponential Decay** learning rate schedule.
@@ -134,11 +140,15 @@ The architecture is using a **CRNN** (Convolutional Recurrent Neural Network) an
 2. **Classification**  
    - **Genre** accuracy and detailed classification report (precision, recall, F1).
 
-3. **Top-K Predictions**  
-   - We can retrieve the top 3 most likely genres per track from the softmax output.
+3. **Seeds (Multi-Label)**  
+   - **Binary accuracy** or other multi-label metrics.  
+   - At inference time, we apply a probability threshold (e.g., 0.5) to decide which seeds are predicted.  
+
+4. **Top-K Genre Predictions**  
+   - We can retrieve the top 3 most likely genres from the softmax output.
 
 ---
 
 ## **7. Summary**
 
-This model combines **CNN**-based feature extraction with a **BiLSTM** for temporal context, ending in two separate heads for **emotion regression** and **genre classification**. By chunking audio and applying augmentations, the model learns robust representations that help it excel at both continuous (V/A/D) and categorical (genre) tasks.
+This model combines **CNN**-based feature extraction with a **BiLSTM** for temporal context, ending in **three** separate heads for **emotion regression**, **genre classification**, and **multi-label seed prediction**. By chunking audio into 5s segments and applying a variety of augmentations, it learns robust representations that help it excel at **continuous** (V/A/D) and **categorical** (genre) tasks, as well as **multi-label** emotional seed tagging.
