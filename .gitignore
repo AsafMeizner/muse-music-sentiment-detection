@@ -1,4 +1,4 @@
 .env
 *.npz
 *.mp3
-audio_previews\*.mp3
+audio_previews/

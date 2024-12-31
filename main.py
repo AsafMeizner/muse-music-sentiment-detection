@@ -1,5 +1,8 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Optional; sometimes helps with certain CPU issues
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Sometimes helps with certain CPU issues
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)  # Suppress common librosa/mp3 warnings
 
 import ast
 import random
@@ -40,34 +43,39 @@ tf.random.set_seed(SEED)
 # -----------------------------------------------------------------------------
 MAX_PAD_LENGTH = 300      # number of frames in Mel spectrogram
 TOP_GENRES = 30
-TOP_SEEDS = 30            # limit seeds to top 15
+TOP_SEEDS = 30
 BATCH_SIZE = 32
 EPOCHS = 60               # can increase if you have time
 INITIAL_LR = 1e-4
 L2_REG = 1e-4
-CHUNK_DURATION = 15        # each chunk is 15s
-MAX_AUDIO_DURATION = 2000 # maximum audio duration in seconds (1 hour)
+CHUNK_DURATION = 15       # 15s chunks
+MAX_AUDIO_DURATION = 1200 # 20 minutes max (to avoid extremely long files)
+TARGET_SR = 22050         # Fixed sample rate for faster consistent processing
 
 # -----------------------------------------------------------------------------
 # Data Augmentation Helpers
 # -----------------------------------------------------------------------------
 def augment_audio_waveform(y, sr):
     """Random time-stretch, pitch shift, and additive noise."""
-    if np.random.rand() < 0.5:
+    # Comment out or reduce if you want to speed up training/preprocessing
+    if np.random.rand() < 0.3:  # reduce chance from 0.5 to 0.3
         rate = np.random.uniform(0.9, 1.1)
         y = librosa.effects.time_stretch(y, rate=rate)
-    if np.random.rand() < 0.5:
+    if np.random.rand() < 0.3:
         steps = np.random.randint(-2, 3)  # from -2 to 2 semitones
         y = librosa.effects.pitch_shift(y, sr=sr, n_steps=steps)
-    if np.random.rand() < 0.5:
+    if np.random.rand() < 0.3:
         noise = np.random.normal(0, 0.005, y.shape)
         y = y + noise
     return y
 
-def spec_augment(mel_spec_db, num_masks=2,
-                 freq_masking_max_percentage=0.15,
-                 time_masking_max_percentage=0.15):
-    """SpecAugment: random frequency and time masking."""
+def spec_augment(mel_spec_db, num_masks=1,
+                 freq_masking_max_percentage=0.10,
+                 time_masking_max_percentage=0.10):
+    """
+    SpecAugment: random frequency and time masking.
+    Reduced the default num_masks and percentages to speed up.
+    """
     augmented = mel_spec_db.copy()
     num_mels, max_frames = augmented.shape
 
@@ -88,10 +96,10 @@ def spec_augment(mel_spec_db, num_masks=2,
 # -----------------------------------------------------------------------------
 # Audio Splitting / Chunking
 # -----------------------------------------------------------------------------
-def split_audio_into_chunks(y, sr, chunk_duration=5):
+def split_audio_into_chunks(y, sr, chunk_duration=15):
     """
     Split the entire audio array `y` into consecutive fixed-size chunks 
-    of length `chunk_duration` seconds. Discards any leftover if it 
+    of length `chunk_duration` seconds. Discards leftover if it 
     doesn't fit exactly.
     """
     chunk_samples = int(chunk_duration * sr)
@@ -106,12 +114,18 @@ def split_audio_into_chunks(y, sr, chunk_duration=5):
 # -----------------------------------------------------------------------------
 # Feature Extraction
 # -----------------------------------------------------------------------------
-def extract_features_from_waveform(y, sr, max_pad_length=300, augment=False):
-    """Compute Mel spectrogram => dB => normalize => optional spec augment."""
+def extract_features_from_waveform(
+    y, sr, max_pad_length=300, augment=False
+):
+    """
+    Compute Mel spectrogram => dB => normalize => optional spec augment.
+    """
     try:
         if augment:
             y = augment_audio_waveform(y, sr)
 
+        # Compute mel-spectrogram
+        # For speed, you can lower n_mels or hop_length, etc.
         mel_spec = librosa.feature.melspectrogram(
             y=y, sr=sr, n_mels=128, fmax=8000
         )
@@ -138,31 +152,27 @@ def extract_features_from_waveform(y, sr, max_pad_length=300, augment=False):
             mel_spec_db = mel_spec_db[:, :max_pad_length]
 
         return mel_spec_db
-    except:
+    except Exception as e:
+        # Optionally log the error
         return None
 
-def process_audio_file_to_chunks(file_path,
-                                 max_duration=3600,  # up to 1 hour
-                                 chunk_duration=5,
-                                 max_pad_length=300,
-                                 augment=False):
+def process_audio_file_to_chunks(
+    file_path,
+    max_duration=1200,   # Up to 20 min
+    chunk_duration=15,
+    max_pad_length=300,
+    augment=False,
+    sr=22050
+):
     """
-    Load up to `max_duration` seconds of audio from `file_path`, 
+    Load up to `max_duration` seconds of audio at `sr` sample rate,
     split into chunks, and extract Mel-spectrogram features.
-
-    Args:
-        file_path (str): Path to the audio file
-        max_duration (int): Maximum duration in seconds to load (1 hour).
-        chunk_duration (int): Duration for each chunk (seconds).
-        max_pad_length (int): Number of frames for spectrogram padding.
-        augment (bool): Whether to apply waveform and spectrogram augmentations.
-
-    Returns:
-        list of numpy arrays: The Mel-spectrograms for each chunk
     """
     try:
-        # Load the entire audio (or up to max_duration)
-        y, sr = librosa.load(file_path, sr=None, mono=True, duration=max_duration)
+        # Force a fixed sample rate for consistency + speed
+        y, sr = librosa.load(
+            file_path, sr=sr, mono=True, duration=max_duration
+        )
         if y is None or len(y) == 0:
             return []
 
@@ -179,28 +189,43 @@ def process_audio_file_to_chunks(file_path,
                 all_features.append(feat)
         return all_features
 
-    except:
+    except Exception as e:
+        # Possibly log or skip
         return []
 
-def parallel_extract_features_in_chunks(audio_paths,
-                                        max_duration=3600,
-                                        chunk_duration=5,
-                                        max_pad_length=300,
-                                        augment=False,
-                                        num_workers=None):
-    """Parallelize feature extraction across files."""
+def parallel_extract_features_in_chunks(
+    audio_paths,
+    max_duration=1200,
+    chunk_duration=15,
+    max_pad_length=300,
+    augment=False,
+    sr=22050,
+    num_workers=2
+):
+    """
+    Parallelize feature extraction across files.
+    Using a small num_workers (like 2) if I/O is an issue.
+    """
     process_func = partial(
         process_audio_file_to_chunks,
         max_duration=max_duration,
         chunk_duration=chunk_duration,
         max_pad_length=max_pad_length,
-        augment=augment
+        augment=augment,
+        sr=sr
     )
 
     all_features = []
     all_file_indices = []
+
+    # Sometimes, concurrency might slow things if the dataset is huge
+    # due to I/O overhead. Adjust as needed.
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        results = list(tqdm(executor.map(process_func, audio_paths), total=len(audio_paths)))
+        results = list(tqdm(
+            executor.map(process_func, audio_paths),
+            total=len(audio_paths),
+            desc="Extracting Features"
+        ))
 
     for file_idx, feats_list in enumerate(results):
         for f in feats_list:
@@ -213,15 +238,11 @@ def parallel_extract_features_in_chunks(audio_paths,
 # Data Preparation
 # -----------------------------------------------------------------------------
 def filter_top_genres(df, top_n=TOP_GENRES):
-    """
-    Keep only the top_n most frequent genres, remove 'indie' if present.
-    """
+    """Keep only the top_n most frequent genres, remove 'indie' if present."""
     genre_counts = df['genre'].value_counts()
     top_genres = genre_counts.head(top_n).index.tolist()
-
     if 'indie' in top_genres:
         top_genres.remove('indie')
-
     df_filtered = df[df['genre'].isin(top_genres)].copy()
     return df_filtered
 
@@ -240,30 +261,37 @@ def filter_top_seeds(df, top_n=TOP_SEEDS):
     df['seeds_parsed'] = df['seeds_parsed'].apply(keep_top)
     return df
 
-def prepare_data_with_chunks(df, 
-                             scaler, 
-                             genre_encoder, 
-                             seed_encoder,
-                             fit_scaler=False, 
-                             augment=False,
-                             max_duration=3600,
-                             chunk_duration=5):
+def prepare_data_with_chunks(
+    df, 
+    scaler, 
+    genre_encoder, 
+    seed_encoder,
+    fit_scaler=False, 
+    augment=False,
+    max_duration=1200,
+    chunk_duration=15,
+    sr=22050,
+    num_workers=2
+):
     """
     Extract chunk-based features from audio files in df.
     Returns:
-      X => shape [N_chunks, 128, max_pad_length]
-      y_reg => shape [N_chunks, 3]
-      y_genre => shape [N_chunks]
-      y_seed => shape [N_chunks, #seeds]
+        X => shape [N_chunks, 128, max_pad_length]
+        y_reg => shape [N_chunks, 3]
+        y_genre => shape [N_chunks]
+        y_seed => shape [N_chunks, #seeds]
     """
     audio_paths = df['audio_previews'].apply(os.path.abspath).to_list()
+    # -- You can optionally do caching here if you'd like. --
+
     X_list, file_indices = parallel_extract_features_in_chunks(
         audio_paths=audio_paths,
         max_duration=max_duration,
         chunk_duration=chunk_duration,
         max_pad_length=MAX_PAD_LENGTH,
         augment=augment,
-        num_workers=4
+        sr=sr,
+        num_workers=num_workers  # small concurrency
     )
     if len(X_list) == 0:
         raise ValueError("No valid audio features extracted.")
@@ -296,8 +324,6 @@ class WeightedBinaryCrossentropy(tf.keras.losses.Loss):
     """
     Weighted binary crossentropy to penalize false-negatives more strongly,
     so it doesn't learn to predict "all zeros" for seeds.
-    
-    pos_weight: float or array shape=[num_seeds], how much to up-weight positives.
     """
     def __init__(self, pos_weight=5.0, from_logits=False, label_smoothing=0, **kwargs):
         super().__init__(**kwargs)
@@ -313,27 +339,26 @@ class WeightedBinaryCrossentropy(tf.keras.losses.Loss):
     def call(self, y_true, y_pred):
         bce_unreduced = self.bce(y_true, y_pred)
         # Weighted by pos_weight for positive samples
-        # shape: [batch, num_seeds]
         weights = 1.0 + (self.pos_weight - 1.0) * y_true
         return tf.reduce_mean(weights * bce_unreduced)
 
 # -----------------------------------------------------------------------------
 # Transformer-based Model
 # -----------------------------------------------------------------------------
-def build_transformer_model(input_shape,
-                            num_genres,
-                            num_seeds,
-                            l2_reg=1e-4,
-                            initial_lr=1e-4,
-                            genre_label_smoothing=0.1,
-                            seed_pos_weight=5.0):
+def build_transformer_model(
+    input_shape,
+    num_genres,
+    num_seeds,
+    l2_reg=1e-4,
+    initial_lr=1e-4,
+    genre_label_smoothing=0.1,
+    seed_pos_weight=5.0
+):
     """
-    CNN front-end to downsample freq dimension => reshape => Transformer Encoder
-    Then heads: regression (3), single-label (genre), multi-label (seeds).
+    CNN front-end -> Transformer Encoder -> heads: regression, single-label, multi-label.
     """
-    from tensorflow.keras.layers import LayerNormalization, Dense, Dropout, MultiHeadAttention  # type: ignore
+    from tensorflow.keras.layers import LayerNormalization, Dense, Dropout, MultiHeadAttention
 
-    # Transformer block
     class TransformerEncoder(tf.keras.layers.Layer):
         def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate=0.1):
             super().__init__()
@@ -355,13 +380,10 @@ def build_transformer_model(input_shape,
             ffn_output = self.dropout2(ffn_output, training=training)
             return self.layernorm2(out1 + ffn_output)
 
-    # -------------------------------------------------------------------
-    # Build model
-    # -------------------------------------------------------------------
     reg = l2(l2_reg)
     inputs = Input(shape=input_shape)
 
-    # 1) CNN front-end
+    # CNN front-end
     x = Conv2D(64, (3,3), padding='same', kernel_regularizer=reg)(inputs)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
@@ -380,13 +402,12 @@ def build_transformer_model(input_shape,
     features = x.shape[2] * x.shape[3]
     x = Reshape((time_steps, features))(x)
 
-    # 2) Transformer Encoders
-    embed_dim = features   # dimension of each time step
-    # a smaller feed-forward dim inside the transformer
-    ff_dim = 256          
+    # Transformer Encoders
+    embed_dim = features
+    ff_dim = 256
     num_heads = 4
     dropout_rate = 0.2
-    transformer_layers = 2  # you can increase
+    transformer_layers = 2
 
     for _ in range(transformer_layers):
         x = TransformerEncoder(embed_dim, num_heads, ff_dim, dropout_rate)(x)
@@ -398,11 +419,10 @@ def build_transformer_model(input_shape,
     x = Dense(256, activation='relu', kernel_regularizer=reg)(x)
     x = Dropout(0.3)(x)
 
-    # Heads
     # 1) Regression
     reg_output = Dense(3, activation='linear', name='reg_output')(x)
 
-    # 2) Single-label classification (genre) with label smoothing
+    # 2) Single-label classification (genre)
     class_output = Dense(num_genres, activation='softmax', name='class_output')(x)
 
     # 3) Multi-label classification (seeds)
@@ -426,7 +446,7 @@ def build_transformer_model(input_shape,
         loss_weights={
             'reg_output': 1.0,
             'class_output': 1.0,
-            'seed_output': 3.0  # upweight seeds
+            'seed_output': 3.0
         },
         metrics={
             'reg_output': ['mae'],
@@ -442,7 +462,11 @@ def build_transformer_model(input_shape,
 def create_tf_dataset(X, y_reg, y_class, y_seed, batch_size=32, shuffle=True):
     """Create a tf.data.Dataset that yields (X, {'reg_output':..., ...})."""
     ds = tf.data.Dataset.from_tensor_slices(
-        (X, {'reg_output': y_reg, 'class_output': y_class, 'seed_output': y_seed})
+        (X, {
+            'reg_output': y_reg,
+            'class_output': y_class,
+            'seed_output': y_seed
+        })
     )
     if shuffle:
         ds = ds.shuffle(len(X))
@@ -568,9 +592,8 @@ if __name__ == "__main__":
                 return []
         df['seeds_parsed'] = df['seeds'].apply(parse_seed_list)
 
-        # Filter top genres (remove 'indie' if present)
+        # Filter top genres and seeds
         df = filter_top_genres(df, top_n=TOP_GENRES)
-        # Filter top seeds
         df = filter_top_seeds(df, top_n=TOP_SEEDS)
 
         # Label Encoder for genres
@@ -596,23 +619,32 @@ if __name__ == "__main__":
         # Prepare data
         scaler = MinMaxScaler()
 
+        # Increase num_workers with caution if disk I/O is a bottleneck
         X_train, y_train_reg, y_train_genre, y_train_seed = prepare_data_with_chunks(
             train_df, scaler, genre_encoder, seed_encoder,
             fit_scaler=True, augment=True,
-            max_duration=MAX_AUDIO_DURATION,  # up to 1 hour
-            chunk_duration=CHUNK_DURATION     # 5 seconds per chunk
+            max_duration=MAX_AUDIO_DURATION,
+            chunk_duration=CHUNK_DURATION,
+            sr=TARGET_SR,
+            num_workers=2
         )
+
         X_val, y_val_reg, y_val_genre, y_val_seed = prepare_data_with_chunks(
             val_df, scaler, genre_encoder, seed_encoder,
             fit_scaler=False, augment=False,
             max_duration=MAX_AUDIO_DURATION,
-            chunk_duration=CHUNK_DURATION
+            chunk_duration=CHUNK_DURATION,
+            sr=TARGET_SR,
+            num_workers=2
         )
+
         X_test, y_test_reg, y_test_genre, y_test_seed = prepare_data_with_chunks(
             test_df, scaler, genre_encoder, seed_encoder,
             fit_scaler=False, augment=False,
             max_duration=MAX_AUDIO_DURATION,
-            chunk_duration=CHUNK_DURATION
+            chunk_duration=CHUNK_DURATION,
+            sr=TARGET_SR,
+            num_workers=2
         )
 
         # Add channel dimension
@@ -621,16 +653,22 @@ if __name__ == "__main__":
         X_test = X_test[..., np.newaxis]
 
         # Build TF datasets
-        train_ds = create_tf_dataset(X_train, y_train_reg, y_train_genre, y_train_seed,
-                                     batch_size=BATCH_SIZE, shuffle=True)
-        val_ds = create_tf_dataset(X_val, y_val_reg, y_val_genre, y_val_seed,
-                                   batch_size=BATCH_SIZE, shuffle=False)
-        test_ds = create_tf_dataset(X_test, y_test_reg, y_test_genre, y_test_seed,
-                                    batch_size=BATCH_SIZE, shuffle=False)
+        train_ds = create_tf_dataset(
+            X_train, y_train_reg, y_train_genre, y_train_seed,
+            batch_size=BATCH_SIZE, shuffle=True
+        )
+        val_ds = create_tf_dataset(
+            X_val, y_val_reg, y_val_genre, y_val_seed,
+            batch_size=BATCH_SIZE, shuffle=False
+        )
+        test_ds = create_tf_dataset(
+            X_test, y_test_reg, y_test_genre, y_test_seed,
+            batch_size=BATCH_SIZE, shuffle=False
+        )
 
-        # Build model
+        # Build/compile model
         model = build_transformer_model(
-            input_shape=X_train.shape[1:],  # (128, 300, 1)
+            input_shape=X_train.shape[1:],  # e.g. (128, 300, 1)
             num_genres=num_genres,
             num_seeds=num_seeds,
             l2_reg=L2_REG,
@@ -709,8 +747,12 @@ if __name__ == "__main__":
             true_genre = unique_genres[y_test_genre[i]]
             pred_genre_argmax = unique_genres[y_pred_genre[i]]
 
-            true_seed_labels = [s for s, val in zip(unique_seeds, y_test_seed[i]) if val==1]
-            pred_seed_labels = [s for s, val in zip(unique_seeds, y_pred_seed_bin[i]) if val==1]
+            true_seed_labels = [
+                s for s, val in zip(unique_seeds, y_test_seed[i]) if val == 1
+            ]
+            pred_seed_labels = [
+                s for s, val in zip(unique_seeds, y_pred_seed_bin[i]) if val == 1
+            ]
 
             # Sort probabilities for top 3 genres
             pred_probs = y_pred_class[i]
