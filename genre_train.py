@@ -1,197 +1,172 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
 import numpy as np
 import pandas as pd
 import librosa
-from matplotlib import pyplot as plt
-from pydub import AudioSegment
-from tensorflow import keras
-import concurrent.futures
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, MaxPool2D, Flatten, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from tensorflow.image import resize
 
-# -------------------------------
-# Audio Loading and Feature Extraction (in memory)
-# -------------------------------
-def load_audio_from_mp3(mp3_path, offset=0, duration=30):
-    """
-    Load an MP3 file, convert it to a numpy array (in memory), and return (audio, sample_rate).
-    If loading fails, returns (None, None).
-    """
-    try:
-        audio = AudioSegment.from_file(mp3_path, format="mp3")
-    except Exception as e:
-        print(f"Error loading {mp3_path}: {e}")
-        return None, None
+# =============================================================================
+# Create a directory to save model and plots
+# =============================================================================
+RESULTS_DIR = "./genre_results"
+if not os.path.exists(RESULTS_DIR):
+    os.makedirs(RESULTS_DIR)
 
-    start_ms = offset * 1000
-    end_ms = start_ms + duration * 1000
-    audio = audio[start_ms:end_ms]
-    
-    # Convert to numpy array (if stereo, average channels)
-    y = np.array(audio.get_array_of_samples()).astype(np.float32)
-    if audio.channels > 1:
-        y = y.reshape((-1, audio.channels)).mean(axis=1)
-    
-    # Normalize to [-1, 1]
-    max_val = float(2 ** (8 * audio.sample_width - 1))
-    y = y / max_val
-    sr = audio.frame_rate
-    return y, sr
+# =============================================================================
+# Configuration
+# =============================================================================
+# Set the dataset directory.
+# Assumes your dataset is arranged as:
+# ./GTZAN-Dataset/genres_original/<genre_name>/<audio_file>.wav
+data_dir = "./GTZAN-Dataset/genres_original"
+classes = ['blues', 'classical', 'country', 'disco', 'hiphop', 'jazz', 'metal', 'pop', 'reggae', 'rock']
+target_shape = (150, 150)  # Resize mel-spectrogram to this shape
 
-def get_mfcc(mp3_path):
-    y, sr = load_audio_from_mp3(mp3_path, offset=0, duration=30)
-    return None if y is None else librosa.feature.mfcc(y=y, sr=sr)
-
-def get_melspectrogram(mp3_path):
-    y, sr = load_audio_from_mp3(mp3_path, offset=0, duration=30)
-    return None if y is None else librosa.feature.melspectrogram(y=y, sr=sr)
-
-def get_chroma_vector(mp3_path):
-    y, sr = load_audio_from_mp3(mp3_path, offset=0, duration=30)
-    return None if y is None else librosa.feature.chroma_stft(y=y, sr=sr)
-
-def get_tonnetz(mp3_path):
-    y, sr = load_audio_from_mp3(mp3_path, offset=0, duration=30)
-    return None if y is None else librosa.feature.tonnetz(y=y, sr=sr)
-
-def get_feature(mp3_path):
-    """
-    Extracts MFCC, Mel spectrogram, Chroma, and Tonnetz features from an MP3 file.
-    For each feature, the mean, min, and max (across time) are computed and concatenated.
-    Returns a single fixed-length feature vector or None if any feature extraction fails.
-    """
-    mfcc = get_mfcc(mp3_path)
-    melspectrogram = get_melspectrogram(mp3_path)
-    chroma = get_chroma_vector(mp3_path)
-    tonnetz = get_tonnetz(mp3_path)
-
-    if mfcc is None or melspectrogram is None or chroma is None or tonnetz is None:
-        return None
-
-    # Compute statistics for each feature matrix
-    mfcc_feature = np.concatenate((mfcc.mean(axis=1), mfcc.min(axis=1), mfcc.max(axis=1)))
-    melspectrogram_feature = np.concatenate((melspectrogram.mean(axis=1),
-                                             melspectrogram.min(axis=1),
-                                             melspectrogram.max(axis=1)))
-    chroma_feature = np.concatenate((chroma.mean(axis=1),
-                                     chroma.min(axis=1),
-                                     chroma.max(axis=1)))
-    tonnetz_feature = np.concatenate((tonnetz.mean(axis=1),
-                                      tonnetz.min(axis=1),
-                                      tonnetz.max(axis=1)))
-
-    return np.concatenate(
-        (chroma_feature, melspectrogram_feature, mfcc_feature, tonnetz_feature)
-    )
-
-# -------------------------------
-# Parallel Processing Function
-# -------------------------------
-def process_audio_file(args):
-    """
-    Processes a single file: extracts features from the given mp3 file.
-    Returns a tuple (feature, genre) if successful, otherwise None.
-    """
-    mp3_path, genre = args
-    if not os.path.exists(mp3_path):
-        print(f"MP3 file not found: {mp3_path}")
-        return None
-    feat = get_feature(mp3_path)
-    if feat is None:
-        print(f"Feature extraction failed for {mp3_path}")
-        return None
-    return feat, genre
-
-# -------------------------------
-# Main Pipeline
-# -------------------------------
-def main():
-    # Load dataset CSV (adjust the path if needed)
-    data = pd.read_csv("muse_dataset.csv")
-    
-    # Determine the top 15 genres and remove "indie" if present.
-    genre_counts = data['genre'].value_counts()
-    top_genres = genre_counts.head(15).index.tolist()
-    if "indie" in top_genres:
-        top_genres.remove("indie")
-    data = data[data['genre'].isin(top_genres)].reset_index(drop=True)
-    print("Selected top genres:", top_genres)
-    
-    # Create a list of tuples: (mp3 file path, genre)
-    records = list(zip(data["audio_previews"].tolist(), data["genre"].tolist()))
-    
-    # Use parallel processing to extract features.
-    features = []
+# =============================================================================
+# Data Loading and Preprocessing Function
+# =============================================================================
+def load_and_preprocess_data(data_dir, classes, target_shape=(150, 150)):
+    data = []
     labels = []
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        for result in tqdm(executor.map(process_audio_file, records),
-                           total=len(records),
-                           desc="Processing audio files"):
-            if result is not None:
-                feat, genre = result
-                features.append(feat)
-                labels.append(genre)
-    
-    features = np.array(features)
-    labels = np.array(labels)
-    print("Extracted features shape:", features.shape)
-    
-    # Encode genres as integers.
-    unique_genres = np.unique(labels)
-    genre_to_idx = {genre: idx for idx, genre in enumerate(unique_genres)}
-    idx_to_genre = {idx: genre for genre, idx in genre_to_idx.items()}
-    labels_numeric = np.array([genre_to_idx[label] for label in labels])
-    print("Genre mapping:", genre_to_idx)
-    
-    # Shuffle and split the dataset (60% training, 20% validation, 20% testing)
-    num_samples = features.shape[0]
-    indices = np.random.permutation(num_samples)
-    features = features[indices]
-    labels_numeric = labels_numeric[indices]
-    
-    train_split = int(0.6 * num_samples)
-    val_split = int(0.8 * num_samples)
-    features_train = features[:train_split]
-    labels_train = labels_numeric[:train_split]
-    features_val = features[train_split:val_split]
-    labels_val = labels_numeric[train_split:val_split]
-    features_test = features[val_split:]
-    labels_test = labels_numeric[val_split:]
-    
-    print(f"Training samples: {features_train.shape[0]}")
-    print(f"Validation samples: {features_val.shape[0]}")
-    print(f"Testing samples: {features_test.shape[0]}")
-    
-    # Build a simple neural network model.
-    input_shape = features_train.shape[1]
-    num_classes = len(unique_genres)
-    
-    inputs = keras.Input(shape=(input_shape,), name="feature")
-    x = keras.layers.Dense(300, activation="relu", name="dense_1")(inputs)
-    x = keras.layers.Dense(200, activation="relu", name="dense_2")(x)
-    outputs = keras.layers.Dense(num_classes, activation="softmax", name="predictions")(x)
-    
-    model = keras.Model(inputs=inputs, outputs=outputs)
-    model.compile(
-        optimizer=keras.optimizers.RMSprop(),
-        loss=keras.losses.SparseCategoricalCrossentropy(),
-        metrics=[keras.metrics.SparseCategoricalAccuracy()],
-    )
-    
-    model.summary()
-    
-    # Train the model.
-    model.fit(
-        x=features_train,
-        y=labels_train,
-        verbose=1,
-        validation_data=(features_val, labels_val),
-        epochs=64
-    )
-    
-    # Evaluate on the test set.
-    score = model.evaluate(x=features_test, y=labels_test, verbose=0)
-    print('Test Accuracy : {:.2f}%'.format(score[1] * 100))
-    
-if __name__ == "__main__":
-    main()
+    for i_class, class_name in enumerate(classes):
+        class_dir = os.path.join(data_dir, class_name)
+        print("Processing--", class_name)
+        for file_name in os.listdir(class_dir):
+            if file_name.endswith('.wav'):
+                file_path = os.path.join(class_dir, file_name)
+                try:
+                    # Load the audio file
+                    audio_data, sample_rate = librosa.load(file_path, sr=None)
+                    # Set up chunk parameters: 4-second chunks with 2-second overlap
+                    chunk_duration = 4
+                    overlap_duration = 2
+                    chunk_samples = chunk_duration * sample_rate
+                    overlap_samples = overlap_duration * sample_rate
+                    num_chunks = int(np.ceil((len(audio_data) - chunk_samples) / (chunk_samples - overlap_samples))) + 1
+
+                    for i in range(num_chunks):
+                        start = i * (chunk_samples - overlap_samples)
+                        end = start + chunk_samples
+                        chunk = audio_data[start:end]
+                        # Compute mel spectrogram
+                        mel_spectrogram = librosa.feature.melspectrogram(y=chunk, sr=sample_rate)
+                        # Expand dims to add a channel dimension
+                        mel_spectrogram = np.expand_dims(mel_spectrogram, axis=-1)
+                        # Resize spectrogram to target shape using tf.image.resize
+                        mel_spectrogram_resized = resize(mel_spectrogram, target_shape).numpy()
+                        data.append(mel_spectrogram_resized)
+                        labels.append(i_class)
+                except Exception as e:
+                    print(f"Error processing file {file_path}: {e}")
+    return np.array(data), np.array(labels)
+
+# =============================================================================
+# Load Data
+# =============================================================================
+data, labels = load_and_preprocess_data(data_dir, classes, target_shape)
+print("data.shape:", data.shape)
+print("labels.shape:", labels.shape)
+
+# One-hot encode labels
+labels = to_categorical(labels, num_classes=len(classes))
+
+# Split into training and testing sets
+X_train, X_test, Y_train, Y_test = train_test_split(data, labels, test_size=0.2, random_state=42)
+print("X_train.shape:", X_train.shape)
+print("X_test.shape:", X_test.shape)
+
+# =============================================================================
+# Build the CNN Model
+# =============================================================================
+model = tf.keras.models.Sequential()
+
+# Input shape inferred from X_train[0]: e.g. (150, 150, 1)
+model.add(Conv2D(filters=32, kernel_size=3, padding='same', activation='relu', input_shape=X_train[0].shape))
+model.add(Conv2D(filters=32, kernel_size=3, activation='relu'))
+model.add(MaxPool2D(pool_size=2, strides=2))
+
+model.add(Conv2D(filters=64, kernel_size=3, padding='same', activation='relu'))
+model.add(Conv2D(filters=64, kernel_size=3, activation='relu'))
+model.add(MaxPool2D(pool_size=2, strides=2))
+
+model.add(Conv2D(filters=128, kernel_size=3, padding='same', activation='relu'))
+model.add(Conv2D(filters=128, kernel_size=3, activation='relu'))
+model.add(MaxPool2D(pool_size=2, strides=2))
+model.add(Dropout(0.3))
+
+model.add(Conv2D(filters=256, kernel_size=3, padding='same', activation='relu'))
+model.add(Conv2D(filters=256, kernel_size=3, activation='relu'))
+model.add(MaxPool2D(pool_size=2, strides=2))
+
+model.add(Conv2D(filters=512, kernel_size=3, padding='same', activation='relu'))
+model.add(Conv2D(filters=512, kernel_size=3, activation='relu'))
+model.add(MaxPool2D(pool_size=2, strides=2))
+model.add(Dropout(0.3))
+
+model.add(Flatten())
+model.add(Dense(units=1200, activation='relu'))
+model.add(Dropout(0.45))
+model.add(Dense(units=len(classes), activation='softmax'))
+
+model.summary()
+
+# =============================================================================
+# Compile the Model
+# =============================================================================
+model.compile(optimizer=Adam(learning_rate=0.0001),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# =============================================================================
+# Set up Callbacks for Checkpointing and Early Stopping
+# =============================================================================
+checkpoint = ModelCheckpoint(os.path.join(RESULTS_DIR, "best_model.keras"),
+                             save_best_only=True,
+                             monitor='val_loss',
+                             mode='min')
+earlystop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+# =============================================================================
+# Train the Model
+# =============================================================================
+training_history = model.fit(X_train, Y_train,
+                             epochs=30,
+                             batch_size=32,
+                             validation_data=(X_test, Y_test),
+                             callbacks=[checkpoint, earlystop])
+
+# Save the final model in .keras format
+model.save(os.path.join(RESULTS_DIR, "final_model.keras"))
+
+# =============================================================================
+# Plot and Save Training Curves
+# =============================================================================
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(training_history.history['loss'], label='Train Loss')
+plt.plot(training_history.history['val_loss'], label='Val Loss')
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Loss Curve")
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(training_history.history['accuracy'], label='Train Accuracy')
+plt.plot(training_history.history['val_accuracy'], label='Val Accuracy')
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Accuracy Curve")
+plt.legend()
+plt.tight_layout()
+
+plot_path = os.path.join(RESULTS_DIR, "training_curves.png")
+plt.savefig(plot_path)
+plt.show()
+
+print("Model and training plots have been saved to", RESULTS_DIR)

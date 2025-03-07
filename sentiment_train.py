@@ -6,247 +6,233 @@ import librosa.display
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
 
 # =============================================================================
-# 1) SETUP & PARAMETERS
+# 0) SET UP RESULTS DIRECTORY
 # =============================================================================
-# Paths (adjust BASE_PATH to your system)
-BASE_PATH = "./deam-dataset"  
+results_dir = "./setiment-results"
+os.makedirs(results_dir, exist_ok=True)
+
+# =============================================================================
+# 1) SET PATHS AND PARAMETERS
+# =============================================================================
+# Adjust BASE_PATH to point to your DEAM dataset folder.
+BASE_PATH = "./deam-dataset"
 STATIC_ANNOTATIONS_PATH = os.path.join(
-    BASE_PATH,
-    "DEAM_Annotations", "annotations", "annotations averaged per song", "song_level", 
+    BASE_PATH, "DEAM_Annotations", "annotations", "annotations averaged per song", "song_level", 
     "static_annotations_averaged_songs_1_2000.csv"
 )
 AUDIO_FOLDER = os.path.join(BASE_PATH, "DEAM_audio", "MEMD_audio")
 
 # Audio processing parameters
-SAMPLE_RATE = 22050        # Standard sampling rate
-SEGMENT_DURATION = 3.0       # each segment is 3 seconds long
-NUM_SEGMENTS = 10            # number of segments to extract per track
-
-# Mel-spectrogram parameters for a 3-second segment
-N_MELS = 128
-HOP_LENGTH = 512
-FMIN = 20
-FMAX = 8000
-# Calculate number of frames per 3-second segment
-# Approx frames = SEGMENT_DURATION * (SAMPLE_RATE / HOP_LENGTH)
-SEG_FRAMES = int(np.ceil(SEGMENT_DURATION * SAMPLE_RATE / HOP_LENGTH))
-# For example, 3 * 22050 / 512 ~ 129 frames
-print("SEG_FRAMES:", SEG_FRAMES)
+SAMPLE_RATE = 22050  # Standard sampling rate for music
+DURATION = None      # We load the full track (features are averaged)
 
 # =============================================================================
-# 2) LOAD STATIC (SONG-LEVEL) ANNOTATIONS
+# 2) FEATURE EXTRACTION FUNCTIONS
+# =============================================================================
+def extract_features(file_path, sr=SAMPLE_RATE):
+    """
+    Extract a 193-dimensional feature vector from an audio file.
+    Features:
+      - 40 MFCCs (mean over time)
+      - 12 Chroma STFT values (mean)
+      - 128 Mel-spectrogram (in dB, mean)
+      - 7 Spectral Contrast values (mean)
+      - 6 Tonnetz values (mean, from harmonic component)
+    Returns a numpy array of shape (193,).
+    """
+    try:
+        y, sr = librosa.load(file_path, sr=sr, mono=True)
+    except Exception as e:
+        print("Error loading", file_path, e)
+        return None
+    if y.size == 0:
+        return None
+    # 1. MFCC: 40 coefficients
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+    mfcc_mean = np.mean(mfcc, axis=1)
+    # 2. Chromagram: 12 dimensions
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+    chroma_mean = np.mean(chroma, axis=1)
+    # 3. Mel-spectrogram: 128 mel bands
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    mel_mean = np.mean(mel_db, axis=1)
+    # 4. Spectral Contrast: 7 dimensions (default)
+    spec_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+    spec_contrast_mean = np.mean(spec_contrast, axis=1)
+    # 5. Tonnetz: 6 dimensions (from harmonic component)
+    y_harm = librosa.effects.harmonic(y)
+    tonnetz = librosa.feature.tonnetz(y=y_harm, sr=sr)
+    tonnetz_mean = np.mean(tonnetz, axis=1)
+    # Concatenate all features: 40 + 12 + 128 + 7 + 6 = 193
+    features = np.concatenate((mfcc_mean, chroma_mean, mel_mean, spec_contrast_mean, tonnetz_mean))
+    return features
+
+# =============================================================================
+# 3) LOAD STATIC ANNOTATIONS & EXTRACT FEATURES
 # =============================================================================
 df_static = pd.read_csv(STATIC_ANNOTATIONS_PATH)
-df_static.columns = df_static.columns.str.strip()  # remove extra spaces
+df_static.columns = df_static.columns.str.strip()  # Remove extra spaces
+# Use only song_id, valence_mean, and arousal_mean
 df_static = df_static[["song_id", "valence_mean", "arousal_mean"]]
 print("Total songs in static annotations:", len(df_static))
 
-# =============================================================================
-# 3) UTILITY FUNCTIONS FOR AUDIO PROCESSING
-# =============================================================================
-def load_audio_segments(mp3_path, sr=SAMPLE_RATE, seg_duration=SEGMENT_DURATION, num_segments=NUM_SEGMENTS):
-    """
-    Load an audio file and extract num_segments segments of seg_duration seconds,
-    evenly spaced through the track.
-    Returns a list of audio segments (np.array) or None if the track is too short.
-    """
-    if not os.path.exists(mp3_path):
-        return None
-    y, _ = librosa.load(mp3_path, sr=sr, mono=True)
-    total_duration = librosa.get_duration(y=y, sr=sr)
-    required_duration = seg_duration * num_segments
-    if total_duration < required_duration:
-        return None  # skip tracks that are too short
-    # Calculate start times for segments (evenly spaced)
-    start_times = np.linspace(0, total_duration - seg_duration, num_segments)
-    segments = []
-    for start in start_times:
-        start_sample = int(start * sr)
-        end_sample = start_sample + int(seg_duration * sr)
-        segment = y[start_sample:end_sample]
-        segments.append(segment)
-    return segments
-
-def extract_mel_spectrogram(y, sr, n_mels=N_MELS):
-    """
-    Compute log-mel-spectrogram from audio segment.
-    Returns array of shape [n_mels, time_frames].
-    """
-    S = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_mels=n_mels,
-        hop_length=HOP_LENGTH,
-        fmin=FMIN, fmax=FMAX
-    )
-    S_db = librosa.power_to_db(S, ref=np.max)
-    return S_db
-
-def pad_or_truncate(S_db, target_frames=SEG_FRAMES):
-    """
-    Pad with zeros or truncate the mel-spectrogram S_db (shape [n_mels, t])
-    so that the time dimension is target_frames.
-    """
-    n_mels, t = S_db.shape
-    if t == target_frames:
-        return S_db
-    elif t < target_frames:
-        pad_width = target_frames - t
-        pad_array = np.zeros((n_mels, pad_width), dtype=S_db.dtype)
-        return np.concatenate((S_db, pad_array), axis=1)
-    else:
-        return S_db[:, :target_frames]
-
-# =============================================================================
-# 4) BUILD THE DATASET
-#    For each song, extract NUM_SEGMENTS segments; each segment is converted
-#    to a mel-spectrogram of shape [N_MELS, SEG_FRAMES, 1]. The track-level input
-#    is then an array of shape [NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1].
-#    The target is the song-level [valence_mean, arousal_mean].
-# =============================================================================
 X_list = []
 Y_list = []
 skipped = 0
 
 for idx, row in df_static.iterrows():
-    sid = row["song_id"]
-    val = row["valence_mean"]
-    aro = row["arousal_mean"]
-    mp3_path = os.path.join(AUDIO_FOLDER, f"{int(sid)}.mp3")
-    
-    segments = load_audio_segments(mp3_path, sr=SAMPLE_RATE, seg_duration=SEGMENT_DURATION, num_segments=NUM_SEGMENTS)
-    if segments is None:
+    song_id = int(row["song_id"])
+    file_path = os.path.join(AUDIO_FOLDER, f"{song_id}.mp3")
+    features = extract_features(file_path, sr=SAMPLE_RATE)
+    if features is None:
         skipped += 1
         continue
-    
-    seg_spectrograms = []
-    for seg in segments:
-        S_db = extract_mel_spectrogram(seg, SAMPLE_RATE, n_mels=N_MELS)
-        S_db = pad_or_truncate(S_db, target_frames=SEG_FRAMES)
-        # Expand dims to get a channel dimension: [N_MELS, SEG_FRAMES, 1]
-        S_db = np.expand_dims(S_db, axis=-1)
-        seg_spectrograms.append(S_db)
-    # Stack segments: shape becomes [NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1]
-    X_song = np.stack(seg_spectrograms, axis=0)
-    X_list.append(X_song)
-    Y_list.append([val, aro])
+    X_list.append(features)
+    # Scale labels from [1, 9] to [-0.2, 0.2] using: scaled = (x - 5)*0.05
+    val_scaled = (row["valence_mean"] - 5.0) * 0.05
+    aro_scaled = (row["arousal_mean"] - 5.0) * 0.05
+    Y_list.append([val_scaled, aro_scaled])
 
 X = np.array(X_list, dtype=np.float32)
 Y = np.array(Y_list, dtype=np.float32)
 
-print(f"Built dataset with {len(X)} tracks. Skipped {skipped} tracks.")
-print("X shape:", X.shape)  # (num_tracks, NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1)
+print(f"Extracted features for {len(X)} tracks. Skipped {skipped} tracks.")
+print("X shape:", X.shape)  # (num_tracks, 193)
 print("Y shape:", Y.shape)  # (num_tracks, 2)
 
 # =============================================================================
-# 5) TRAIN/TEST SPLIT
+# 4) DATA SCALING & TRAIN/TEST SPLIT
 # =============================================================================
-X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, Y, test_size=0.2, random_state=42
+)
 print("Train set:", X_train.shape, y_train.shape)
 print("Test set:", X_test.shape, y_test.shape)
 
 # =============================================================================
-# 6) BUILD A HYBRID TIME-DISTRIBUTED CNN + LSTM MODEL
+# 5) BUILD A DEEP FEED-FORWARD NEURAL NETWORK
+#    (Using 6 hidden layers with 500 nodes each, ReLU activation, and Dropout)
 # =============================================================================
-# The model processes each segment via a CNN (shared across segments)
-# and then uses an LSTM to aggregate the segment-level features into a track-level prediction.
-num_segments = NUM_SEGMENTS  # e.g., 10
-input_shape = (N_MELS, SEG_FRAMES, 1)  # shape for one segment
+input_dim = X_train.shape[1]  # should be 193
 
-# Define a CNN feature extractor for one segment
-def create_cnn_extractor(input_shape):
-    model = models.Sequential()
-    model.add(layers.Conv2D(32, (3,3), activation='relu', padding='same', input_shape=input_shape))
-    model.add(layers.BatchNormalization())
-    model.add(layers.MaxPooling2D((2,2)))
-    
-    model.add(layers.Conv2D(64, (3,3), activation='relu', padding='same'))
-    model.add(layers.BatchNormalization())
-    model.add(layers.MaxPooling2D((2,2)))
-    
-    model.add(layers.Conv2D(128, (3,3), activation='relu', padding='same'))
-    model.add(layers.BatchNormalization())
-    model.add(layers.MaxPooling2D((2,2)))
-    
-    model.add(layers.Flatten())
-    # Output dimension can be tuned; here we use 256 units
-    model.add(layers.Dense(256, activation='relu'))
-    return model
+model = models.Sequential()
+model.add(layers.Input(shape=(input_dim,)))
+for i in range(6):
+    model.add(layers.Dense(500, activation='relu'))
+    model.add(layers.Dropout(0.5))
+model.add(layers.Dense(2, activation='linear'))  # Predict [valence, arousal]
 
-cnn_extractor = create_cnn_extractor(input_shape)
-cnn_extractor.summary()
-
-# Now build the full model that accepts a sequence of segments
-# Input shape: (NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1)
-segment_input = layers.Input(shape=(num_segments, N_MELS, SEG_FRAMES, 1))
-# Apply TimeDistributed to use the same CNN for each segment
-td = layers.TimeDistributed(cnn_extractor)(segment_input)
-# td now has shape (batch_size, NUM_SEGMENTS, feature_dim) where feature_dim=256
-# Use an LSTM to aggregate across segments
-lstm_out = layers.LSTM(128, return_sequences=False)(td)
-# Optionally add dropout and dense layers
-dense1 = layers.Dense(64, activation='relu')(lstm_out)
-drop = layers.Dropout(0.3)(dense1)
-output = layers.Dense(2, activation='linear')(drop)  # Predict [valence, arousal]
-
-model = models.Model(inputs=segment_input, outputs=output)
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-              loss='mse',
-              metrics=['mae'])
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
 model.summary()
 
 # =============================================================================
-# 7) TRAIN THE MODEL
+# 6) SET UP CALLBACKS: EARLY STOPPING & MODEL CHECKPOINTS
 # =============================================================================
-early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=100,
-    batch_size=4,  # you might need to adjust batch size depending on memory
-    callbacks=[early_stop],
+checkpoint_path = os.path.join(results_dir, "best_model.h5")
+checkpoint_cb = callbacks.ModelCheckpoint(
+    filepath=checkpoint_path,
+    monitor='val_loss',
+    save_best_only=True,
+    verbose=1
+)
+early_stop_cb = callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=15,
+    restore_best_weights=True,
     verbose=1
 )
 
 # =============================================================================
-# 8) EVALUATE THE MODEL
+# 7) TRAIN THE MODEL
+# =============================================================================
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=100,
+    batch_size=32,
+    callbacks=[checkpoint_cb, early_stop_cb],
+    verbose=1
+)
+
+# =============================================================================
+# 8) SAVE THE FINAL MODEL
+# =============================================================================
+final_model_path = os.path.join(results_dir, "final_model.h5")
+model.save(final_model_path)
+print("Final model saved to:", final_model_path)
+
+# =============================================================================
+# 9) PLOT TRAINING CURVES & SAVE GRAPHS
+# =============================================================================
+# Plot Loss Curves
+plt.figure(figsize=(8, 6))
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title("Training and Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("MSE Loss")
+plt.legend()
+loss_plot_path = os.path.join(results_dir, "loss_curve.png")
+plt.savefig(loss_plot_path)
+plt.show()
+
+# Plot MAE Curves
+plt.figure(figsize=(8, 6))
+plt.plot(history.history['mae'], label='Train MAE')
+plt.plot(history.history['val_mae'], label='Val MAE')
+plt.title("Training and Validation MAE")
+plt.xlabel("Epoch")
+plt.ylabel("Mean Absolute Error")
+plt.legend()
+mae_plot_path = os.path.join(results_dir, "mae_curve.png")
+plt.savefig(mae_plot_path)
+plt.show()
+
+# =============================================================================
+# 10) EVALUATE THE MODEL
 # =============================================================================
 test_loss, test_mae = model.evaluate(X_test, y_test, verbose=0)
 print("Test MSE (loss):", test_loss)
 print("Test MAE:", test_mae)
 
-# Additionally compute Pearson correlation for each target dimension
 preds = model.predict(X_test)
-from scipy.stats import pearsonr
 val_corr, _ = pearsonr(y_test[:, 0], preds[:, 0])
 aro_corr, _ = pearsonr(y_test[:, 1], preds[:, 1])
 print("Valence Pearson Corr:", val_corr)
 print("Arousal Pearson Corr:", aro_corr)
 
 # =============================================================================
-# 9) PREDICTION ON A NEW TRACK
-#    This function extracts NUM_SEGMENTS segments from a new track,
-#    processes them through the model, and outputs a single prediction.
+# 11) PREDICTION ON A NEW AUDIO FILE
+#    (Inverts the scaling to return predictions on the original [1,9] scale)
 # =============================================================================
-def predict_track_valence_arousal(mp3_path, num_segments=NUM_SEGMENTS, seg_duration=SEGMENT_DURATION):
-    segments = load_audio_segments(mp3_path, sr=SAMPLE_RATE, seg_duration=seg_duration, num_segments=num_segments)
-    if segments is None:
-        print("Track too short or file not found.")
+def predict_emotion(file_path, scaler_X, model):
+    """
+    Given an audio file, extract the 193-dim feature vector, scale it,
+    predict the scaled [valence, arousal], then invert scaling to return
+    predictions on the original scale [1,9].
+    """
+    features = extract_features(file_path, sr=SAMPLE_RATE)
+    if features is None:
         return None
-    seg_specs = []
-    for seg in segments:
-        S_db = extract_mel_spectrogram(seg, SAMPLE_RATE, n_mels=N_MELS)
-        S_db = pad_or_truncate(S_db, target_frames=SEG_FRAMES)
-        S_db = np.expand_dims(S_db, axis=-1)
-        seg_specs.append(S_db)
-    X_track = np.stack(seg_specs, axis=0)  # shape: (NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1)
-    X_track = np.expand_dims(X_track, axis=0)  # add batch dimension: (1, NUM_SEGMENTS, N_MELS, SEG_FRAMES, 1)
-    prediction = model.predict(X_track)[0]
-    return prediction
+    features_scaled = scaler_X.transform(features.reshape(1, -1))
+    pred_scaled = model.predict(features_scaled)[0]
+    # Invert scaling: (pred_scaled / 0.05) + 5
+    val_pred = pred_scaled[0] / 0.05 + 5.0
+    aro_pred = pred_scaled[1] / 0.05 + 5.0
+    return np.array([val_pred, aro_pred])
 
 # Example usage:
-example_mp3 = os.path.join(AUDIO_FOLDER, "25.mp3")  # change to a valid file ID
-predicted_values = predict_track_valence_arousal(example_mp3)
-if predicted_values is not None:
-    print("\nExample Track Prediction (Valence, Arousal):", predicted_values)
+example_file = os.path.join(AUDIO_FOLDER, "25.mp3")  # replace with a valid file id
+prediction = predict_emotion(example_file, scaler, model)
+if prediction is not None:
+    print("\nPrediction for track (Valence, Arousal) on original scale [1,9]:", prediction)
