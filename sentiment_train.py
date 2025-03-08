@@ -10,333 +10,265 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from tqdm import tqdm
+import warnings
 
-# =============================================================================
-# 0) SET UP RESULTS DIRECTORY
-# =============================================================================
-results_dir = "./setiment-results"
-os.makedirs(results_dir, exist_ok=True)
+# Suppress warnings from librosa
+warnings.filterwarnings("ignore", message="PySoundFile failed. Trying audioread instead.")
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa.core.audio")
 
-# =============================================================================
-# 1) SET PATHS AND PARAMETERS
-# =============================================================================
-BASE_PATH = "./deam-dataset"  # adjust if needed
-
-# Corrected dynamic annotation paths:
-DYN_AROUSAL_PATH = os.path.join(
-    BASE_PATH, "DEAM_Annotations", "annotations", "annotations averaged per song",
-    "dynamic (per second annotations)", "arousal.csv"
-)
-DYN_VALENCE_PATH = os.path.join(
-    BASE_PATH, "DEAM_Annotations", "annotations", "annotations averaged per song",
-    "dynamic (per second annotations)", "valence.csv"
-)
+# ----------------------------
+# Global Parameters and Paths
+# ----------------------------
+BASE_PATH = "./deam-dataset"  # Adjust to your DEAM dataset location
+STATIC_CSV = os.path.join(BASE_PATH, "DEAM_Annotations", "annotations", "annotations averaged per song", "song_level", "static_annotations_averaged_songs_1_2000.csv")
 AUDIO_FOLDER = os.path.join(BASE_PATH, "DEAM_audio", "MEMD_audio")
+RESULTS_DIR = "./setiment-results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 SAMPLE_RATE = 22050
-# Use 5-second segments
-SEGMENT_LENGTH = 5.0
-BIN_SIZE = 5.0  # seconds per bin
+CHUNK_DURATION = 30.0  # seconds to extract from each song (from the middle)
 
-# =============================================================================
-# 2) UTILITY FUNCTIONS FOR FEATURE EXTRACTION
-# =============================================================================
-def extract_features_from_audio(y, sr):
-    """
-    Extract a 193-dimensional feature vector from audio segment y.
-    Features:
-      - 40 MFCCs (mean over time)
-      - 12 Chroma STFT (mean)
-      - 128 Mel-spectrogram (in dB, mean)
-      - 7 Spectral Contrast (mean)
-      - 6 Tonnetz (mean from harmonic component)
-    Returns: numpy array of shape (193,)
-    """
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
-    mfcc_mean = np.mean(mfcc, axis=1)
-    
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-    chroma_mean = np.mean(chroma, axis=1)
-    
-    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    mel_mean = np.mean(mel_db, axis=1)
-    
-    spec_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-    spec_contrast_mean = np.mean(spec_contrast, axis=1)
-    
-    y_harm = librosa.effects.harmonic(y)
-    tonnetz = librosa.feature.tonnetz(y=y_harm, sr=sr)
-    tonnetz_mean = np.mean(tonnetz, axis=1)
-    
-    features = np.concatenate((mfcc_mean, chroma_mean, mel_mean, spec_contrast_mean, tonnetz_mean))
-    return features
+# Mel-spectrogram parameters
+N_MELS = 128
+HOP_LENGTH = 512
+FMIN = 20
+FMAX = 8000
+TARGET_FRAMES = 256  # Fix the time dimension (approx 30s -> 256 frames)
 
-def extract_segment_features(file_path, start_sec, duration=SEGMENT_LENGTH, sr=SAMPLE_RATE):
-    """
-    Load a segment from file_path starting at start_sec for duration seconds,
-    and extract a 193-dim feature vector.
-    """
+# ----------------------------
+# Helper Functions
+# ----------------------------
+def load_fixed_chunk(file_path, sr=SAMPLE_RATE, duration=CHUNK_DURATION):
+    """Load a fixed chunk (duration seconds) from the middle of the audio."""
     try:
-        y, _ = librosa.load(file_path, sr=sr, mono=True, offset=start_sec, duration=duration)
+        y, _ = librosa.load(file_path, sr=sr, mono=True)
     except Exception as e:
-        print("Error loading segment from", file_path, e)
+        print("Error loading", file_path, e)
         return None
-    if len(y) < int(sr * duration):
+    total_duration = librosa.get_duration(y=y, sr=sr)
+    if total_duration < duration:
         return None
-    return extract_features_from_audio(y, sr)
+    start_sec = max(0, (total_duration / 2.0) - (duration / 2.0))
+    end_sec = start_sec + duration
+    start_sample = int(start_sec * sr)
+    end_sample = int(end_sec * sr)
+    return y[start_sample:end_sample], sr
 
-# =============================================================================
-# 3) BUILD DYNAMIC DATASET FROM ANNOTATIONS
-# =============================================================================
-# Load dynamic annotation CSV files
-df_dyn_arousal = pd.read_csv(DYN_AROUSAL_PATH)
-df_dyn_valence = pd.read_csv(DYN_VALENCE_PATH)
-df_dyn_arousal.columns = df_dyn_arousal.columns.str.strip()
-df_dyn_valence.columns = df_dyn_valence.columns.str.strip()
+def compute_mel_spectrogram(y, sr, n_mels=N_MELS, hop_length=HOP_LENGTH, fmin=FMIN, fmax=FMAX):
+    """Compute log-mel spectrogram (in dB) from audio y."""
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length, fmin=fmin, fmax=fmax)
+    S_db = librosa.power_to_db(S, ref=np.max)
+    return S_db
 
-# Merge based on song_id; suffix _val for valence and _aro for arousal.
-df_dyn = pd.merge(df_dyn_valence, df_dyn_arousal, on="song_id", suffixes=("_val", "_aro"))
+def fix_spectrogram_length(S, target_frames=TARGET_FRAMES):
+    """Pad or truncate spectrogram S (shape: [n_mels, T]) to exactly target_frames along time axis."""
+    n_mels, T = S.shape
+    if T < target_frames:
+        pad_width = target_frames - T
+        S_fixed = np.pad(S, ((0,0), (0, pad_width)), mode='constant')
+    else:
+        S_fixed = S[:, :target_frames]
+    return S_fixed
 
-# Get time points from columns (assume columns are like "sample_15000ms_val")
-time_cols = [col for col in df_dyn.columns if col.startswith("sample_") and col.endswith("ms_val")]
-# Convert column names to seconds: "sample_15000ms_val" -> 15.0
-time_points = sorted([int(col.split('_')[1].replace('ms',''))/1000.0 for col in time_cols])
+def process_audio_file(file_path, sr=SAMPLE_RATE, duration=CHUNK_DURATION, target_frames=TARGET_FRAMES):
+    """
+    Load a fixed chunk from the middle of the audio file,
+    compute its log-mel spectrogram, fix the time axis to target_frames,
+    transpose (to shape [T, n_mels]) and add a channel dimension.
+    Returns an array of shape (target_frames, n_mels, 1).
+    """
+    chunk_data = load_fixed_chunk(file_path, sr=sr, duration=duration)
+    if chunk_data is None:
+        return None
+    y_chunk, sr = chunk_data
+    S_db = compute_mel_spectrogram(y_chunk, sr)
+    S_fixed = fix_spectrogram_length(S_db, target_frames=target_frames)
+    S_fixed = S_fixed.T  # shape becomes (T, n_mels)
+    return np.expand_dims(S_fixed, -1)  # shape: (T, n_mels, 1)
 
-# For each song, bin annotations into 5-second intervals.
-X_dyn = []
-Y_dyn = []
+def scale_label(label):
+    """Scale label from [1,9] to approximately [-0.2, 0.2]."""
+    return (label - 5.0) * 0.05
 
-for idx, row in tqdm(df_dyn.iterrows(), total=len(df_dyn), desc="Building dynamic dataset"):
-    song_id = int(row["song_id"])
-    file_path = os.path.join(AUDIO_FOLDER, f"{song_id}.mp3")
-    if not os.path.exists(file_path):
-        continue
-    t_max = max(time_points)
-    # Create bins from 0 to t_max with BIN_SIZE interval
-    bins = np.arange(0, t_max+BIN_SIZE, BIN_SIZE)
-    for b in range(len(bins)-1):
-        bin_start = bins[b]
-        bin_end = bins[b+1]
-        val_values = []
-        aro_values = []
-        for t in time_points:
-            if bin_start <= t < bin_end:
-                col_val = f"sample_{int(t*1000)}ms_val"
-                col_aro = f"sample_{int(t*1000)}ms_aro"
-                if col_val in df_dyn.columns and col_aro in df_dyn.columns:
-                    val_values.append(row[col_val])
-                    aro_values.append(row[col_aro])
-        if len(val_values)==0 or len(aro_values)==0:
+def invert_label(scaled):
+    """Invert scaling: original = (scaled / 0.05) + 5."""
+    return (scaled / 0.05) + 5.0
+
+def build_dataset(static_csv, audio_folder, sr=SAMPLE_RATE, duration=CHUNK_DURATION, target_frames=TARGET_FRAMES, max_songs=None):
+    """
+    Build dataset from static annotations.
+    For each song, load a fixed chunk and compute its mel-spectrogram.
+    Returns X (shape: [num_songs, target_frames, n_mels, 1]) and Y (scaled labels).
+    """
+    df = pd.read_csv(static_csv)
+    df.columns = df.columns.str.strip()
+    df = df[["song_id", "valence_mean", "arousal_mean"]]
+    X_list = []
+    Y_list = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing static songs"):
+        if max_songs is not None and idx >= max_songs:
+            break
+        song_id = int(row["song_id"])
+        file_path = os.path.join(audio_folder, f"{song_id}.mp3")
+        if not os.path.exists(file_path):
             continue
-        avg_val = np.mean(val_values)
-        avg_aro = np.mean(aro_values)
-        # Scale labels: (x - 5)*0.05
-        avg_val_scaled = (avg_val - 5.0)*0.05
-        avg_aro_scaled = (avg_aro - 5.0)*0.05
-        seg_features = extract_segment_features(file_path, start_sec=bin_start, duration=SEGMENT_LENGTH, sr=SAMPLE_RATE)
-        if seg_features is None:
+        processed = process_audio_file(file_path, sr=sr, duration=duration, target_frames=target_frames)
+        if processed is None:
             continue
-        X_dyn.append(seg_features)
-        Y_dyn.append([avg_val_scaled, avg_aro_scaled])
+        X_list.append(processed)
+        val_scaled = scale_label(row["valence_mean"])
+        aro_scaled = scale_label(row["arousal_mean"])
+        Y_list.append([val_scaled, aro_scaled])
+    X = np.array(X_list, dtype=np.float32)
+    Y = np.array(Y_list, dtype=np.float32)
+    return X, Y
 
-X_dyn = np.array(X_dyn, dtype=np.float32)
-Y_dyn = np.array(Y_dyn, dtype=np.float32)
-print(f"\nDynamic dataset: {X_dyn.shape[0]} segments extracted.")
-
-# =============================================================================
-# 3b) Plot distribution of dynamic labels (in original [1,9] scale)
-# =============================================================================
-def invert_scaling(scaled_val):
-    return (scaled_val / 0.05) + 5.0
-
-Y_dyn_orig = invert_scaling(Y_dyn)
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.hist(Y_dyn_orig[:,0], bins=30, color='skyblue', edgecolor='k')
-plt.title("Dynamic Valence Distribution (Original Scale)")
-plt.xlabel("Valence")
-plt.ylabel("Frequency")
-plt.subplot(1,2,2)
-plt.hist(Y_dyn_orig[:,1], bins=30, color='salmon', edgecolor='k')
-plt.title("Dynamic Arousal Distribution (Original Scale)")
-plt.xlabel("Arousal")
-plt.ylabel("Frequency")
-plt.tight_layout()
-plt.savefig(os.path.join(results_dir, "dynamic_label_distribution.png"))
-plt.show()
-
-# =============================================================================
-# 4) SCALE FEATURES & SPLIT DYNAMIC DATASET
-# =============================================================================
-scaler_dyn = StandardScaler()
-X_dyn_scaled = scaler_dyn.fit_transform(X_dyn)
-
-X_train, X_test, y_train, y_test = train_test_split(X_dyn_scaled, Y_dyn, test_size=0.2, random_state=42)
-print("Dynamic Train set:", X_train.shape, y_train.shape)
-print("Dynamic Test set:", X_test.shape, y_test.shape)
-
-# =============================================================================
-# 5) BUILD A DEEP FEED-FORWARD NETWORK FOR DYNAMIC PREDICTION
-# =============================================================================
-input_dim_dyn = X_train.shape[1]  # should be 193
-dyn_model = models.Sequential()
-dyn_model.add(layers.Input(shape=(input_dim_dyn,)))
-for i in range(6):
-    dyn_model.add(layers.Dense(500, activation='relu'))
-    dyn_model.add(layers.Dropout(0.5))
-dyn_model.add(layers.Dense(2, activation='linear'))
-dyn_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+def build_improved_model(input_shape):
+    """
+    Build an improved CNN model with a VGG-style architecture.
+    Input shape: (TARGET_FRAMES, N_MELS, 1)
+    The model applies several convolutional blocks, then global average pooling,
+    followed by dense layers to predict valence and arousal.
+    """
+    inputs = layers.Input(shape=input_shape)
+    # Block 1
+    x = layers.Conv2D(32, (3,3), activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(32, (3,3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2,2))(x)
+    # Block 2
+    x = layers.Conv2D(64, (3,3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(64, (3,3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2,2))(x)
+    # Block 3
+    x = layers.Conv2D(128, (3,3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(128, (3,3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2,2))(x)
+    # Global Average Pooling
+    x = layers.GlobalAveragePooling2D()(x)
+    # Dense layers
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(2, activation='linear')(x)
+    
+    model = models.Model(inputs, outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
                   loss='mse',
                   metrics=['mae'])
-dyn_model.summary()
+    return model
 
-# =============================================================================
-# 6) SET UP CALLBACKS: EARLY STOPPING & CHECKPOINTS (DYNAMIC MODEL)
-# =============================================================================
-checkpoint_path_dyn = os.path.join(results_dir, "best_dyn_model.h5")
-checkpoint_cb_dyn = callbacks.ModelCheckpoint(filepath=checkpoint_path_dyn,
-                                              monitor='val_loss',
-                                              save_best_only=True,
-                                              verbose=1)
-early_stop_cb_dyn = callbacks.EarlyStopping(monitor='val_loss',
-                                            patience=15,
-                                            restore_best_weights=True,
-                                            verbose=1)
-
-# =============================================================================
-# 7) TRAIN THE DYNAMIC MODEL
-# =============================================================================
-history_dyn = dyn_model.fit(X_train, y_train,
-                            validation_data=(X_test, y_test),
-                            epochs=100,
-                            batch_size=32,
-                            callbacks=[checkpoint_cb_dyn, early_stop_cb_dyn],
-                            verbose=1)
-
-# =============================================================================
-# 8) SAVE THE FINAL DYNAMIC MODEL
-# =============================================================================
-final_dyn_model_path = os.path.join(results_dir, "final_dyn_model.h5")
-dyn_model.save(final_dyn_model_path)
-print("Final dynamic model saved to:", final_dyn_model_path)
-
-# =============================================================================
-# 9) PLOT TRAINING CURVES FOR DYNAMIC MODEL
-# =============================================================================
-plt.figure(figsize=(8,6))
-plt.plot(history_dyn.history['loss'], label='Train Loss')
-plt.plot(history_dyn.history['val_loss'], label='Val Loss')
-plt.title("Dynamic Model: Training and Validation Loss")
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss (scaled)")
-plt.legend()
-plt.savefig(os.path.join(results_dir, "dyn_loss_curve.png"))
-plt.show()
-
-plt.figure(figsize=(8,6))
-plt.plot(history_dyn.history['mae'], label='Train MAE')
-plt.plot(history_dyn.history['val_mae'], label='Val MAE')
-plt.title("Dynamic Model: Training and Validation MAE")
-plt.xlabel("Epoch")
-plt.ylabel("MAE (scaled)")
-plt.legend()
-plt.savefig(os.path.join(results_dir, "dyn_mae_curve.png"))
-plt.show()
-
-# =============================================================================
-# 10) EVALUATE THE DYNAMIC MODEL
-# =============================================================================
-test_loss_dyn, test_mae_dyn = dyn_model.evaluate(X_test, y_test, verbose=0)
-print("Dynamic Model Test MSE (loss):", test_loss_dyn)
-print("Dynamic Model Test MAE:", test_mae_dyn)
-preds_dyn = dyn_model.predict(X_test)
-val_corr_dyn, _ = pearsonr(y_test[:, 0], preds_dyn[:, 0])
-aro_corr_dyn, _ = pearsonr(y_test[:, 1], preds_dyn[:, 1])
-print("Dynamic Model Valence Pearson Corr:", val_corr_dyn)
-print("Dynamic Model Arousal Pearson Corr:", aro_corr_dyn)
-
-# =============================================================================
-# 11) PRINT SOME EXAMPLES: ACTUAL VS PREDICTED FOR DYNAMIC SEGMENTS
-# =============================================================================
-num_examples = 10
-print("\n--- Examples from Dynamic Test Set ---")
-for i in range(num_examples):
-    true_scaled = y_test[i]
-    pred_scaled = preds_dyn[i]
-    true_orig = invert_scaling(true_scaled)
-    pred_orig = invert_scaling(pred_scaled)
-    print(f"Example {i+1}:")
-    print(f"  Scaled  -> True: {true_scaled}, Predicted: {pred_scaled}")
-    print(f"  Original-> True: {true_orig}, Predicted: {pred_orig}")
-
-# =============================================================================
-# 12) FUNCTION TO PREDICT DYNAMIC EMOTION THROUGH A SONG
-# =============================================================================
-def predict_dynamic_emotion(file_path, model, scaler_X, seg_length=SEGMENT_LENGTH, sr=SAMPLE_RATE):
-    """
-    Given an audio file, split it into non-overlapping seg_length segments,
-    extract the 193-dim feature vector for each segment, scale it, and predict
-    dynamic [valence, arousal] for each segment.
-    
-    Returns:
-       times: array of segment start times (in seconds)
-       predictions: array of shape (num_segments, 2) with scaled predictions.
-    """
-    if not os.path.exists(file_path):
-        print("File not found:", file_path)
-        return None, None
-    y, _ = librosa.load(file_path, sr=sr, mono=True)
-    duration = librosa.get_duration(y=y, sr=sr)
-    num_segs = int(duration // seg_length)
-    times = []
-    preds = []
-    for i in range(num_segs):
-        start = i * seg_length
-        feat = extract_segment_features(file_path, start_sec=start, duration=seg_length, sr=sr)
-        if feat is None:
-            continue
-        feat_scaled = scaler_X.transform(feat.reshape(1, -1))
-        pred = model.predict(feat_scaled)[0]
-        preds.append(pred)
-        times.append(start)
-    if len(preds) == 0:
-        return None, None
-    return np.array(times), np.array(preds)
-
-# =============================================================================
-# 13) PLOT DYNAMIC PREDICTIONS FOR AN EXAMPLE SONG
-# =============================================================================
-example_song = os.path.join(AUDIO_FOLDER, "25.mp3")  # Replace with a valid file ID
-times, dyn_preds = predict_dynamic_emotion(example_song, dyn_model, scaler_dyn, seg_length=SEGMENT_LENGTH)
-if times is not None:
-    # Invert scaling to original [1,9]
-    dyn_preds_orig = invert_scaling(dyn_preds)
-    mean_pred = np.mean(dyn_preds_orig, axis=0)
-    
-    plt.figure(figsize=(10,5))
-    plt.plot(times, dyn_preds_orig[:,0], label='Valence', marker='o')
-    plt.plot(times, dyn_preds_orig[:,1], label='Arousal', marker='o')
-    plt.xlabel("Time (s)")
-    plt.ylabel("Predicted Value [1,9]")
-    plt.title("Dynamic Emotion Prediction Over Song")
+def plot_training_curves(history, results_dir):
+    plt.figure(figsize=(8,6))
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title("Training and Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss (scaled)")
     plt.legend()
-    plt.savefig(os.path.join(results_dir, "dynamic_time_series.png"))
+    plt.savefig(os.path.join(results_dir, "improved_loss_curve.png"))
     plt.show()
     
-    plt.figure(figsize=(10,4))
+    plt.figure(figsize=(8,6))
+    plt.plot(history.history['mae'], label='Train MAE')
+    plt.plot(history.history['val_mae'], label='Validation MAE')
+    plt.title("Training and Validation MAE")
+    plt.xlabel("Epoch")
+    plt.ylabel("MAE (scaled)")
+    plt.legend()
+    plt.savefig(os.path.join(results_dir, "improved_mae_curve.png"))
+    plt.show()
+
+def plot_evaluation_scatter(y_true, y_pred, results_dir):
+    plt.figure(figsize=(12,5))
     plt.subplot(1,2,1)
-    plt.hist(dyn_preds_orig[:,0], bins=20, color='skyblue', edgecolor='k')
-    plt.title("Valence Distribution (Song)")
-    plt.xlabel("Valence")
+    plt.scatter(y_true[:,0], y_pred[:,0], alpha=0.5, color='blue')
+    plt.xlabel("True Valence (scaled)")
+    plt.ylabel("Predicted Valence (scaled)")
+    plt.title("Predicted vs True Valence")
     plt.subplot(1,2,2)
-    plt.hist(dyn_preds_orig[:,1], bins=20, color='salmon', edgecolor='k')
-    plt.title("Arousal Distribution (Song)")
-    plt.xlabel("Arousal")
+    plt.scatter(y_true[:,1], y_pred[:,1], alpha=0.5, color='red')
+    plt.xlabel("True Arousal (scaled)")
+    plt.ylabel("Predicted Arousal (scaled)")
+    plt.title("Predicted vs True Arousal")
     plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "dynamic_prediction_distribution.png"))
+    plt.savefig(os.path.join(RESULTS_DIR, "improved_predicted_vs_true_scatter.png"))
     plt.show()
+
+def predict_song_emotion(audio_path, model, sr=SAMPLE_RATE, duration=CHUNK_DURATION, target_frames=TARGET_FRAMES):
+    """
+    Given a new audio file, load a fixed chunk (from the middle), compute its mel-spectrogram,
+    and predict song-level valence and arousal.
+    Returns the prediction (scaled).
+    """
+    processed = process_audio_file(audio_path, sr=sr, duration=duration, target_frames=target_frames)
+    if processed is None:
+        print("Could not process audio:", audio_path)
+        return None
+    processed = np.expand_dims(processed, 0)
+    pred_scaled = model.predict(processed)[0]
+    return pred_scaled
+
+# ----------------------------
+# Main Function
+# ----------------------------
+def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
     
-    print("For example song, mean predicted (Valence, Arousal):", mean_pred)
-else:
-    print("No dynamic predictions could be made for the example song.")
+    # Build dataset from static annotations
+    print("Building dataset from static annotations...")
+    X, Y = build_dataset(STATIC_CSV, AUDIO_FOLDER, sr=SAMPLE_RATE, duration=CHUNK_DURATION, target_frames=TARGET_FRAMES, max_songs=300)
+    if X is None or len(X) == 0:
+        print("No data loaded. Check paths.")
+        return
+    print("Dataset shapes:", X.shape, Y.shape)
+    
+    # Split dataset
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+    
+    # Build improved model
+    input_shape = (TARGET_FRAMES, N_MELS, 1)
+    model = build_improved_model(input_shape)
+    model.summary()
+    
+    # Set up callbacks
+    checkpoint_path = os.path.join(RESULTS_DIR, "best_improved_model.h5")
+    checkpoint_cb = callbacks.ModelCheckpoint(filepath=checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1)
+    early_stop_cb = callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1)
+    
+    history = model.fit(X_train, y_train, validation_data=(X_test, y_test),
+                        epochs=100, batch_size=16, callbacks=[checkpoint_cb, early_stop_cb], verbose=1)
+    
+    # Save final model
+    final_model_path = os.path.join(RESULTS_DIR, "final_improved_model.h5")
+    model.save(final_model_path)
+    print("Final model saved to:", final_model_path)
+    
+    # Plot training curves and scatter plots
+    plot_training_curves(history, RESULTS_DIR)
+    preds = model.predict(X_test)
+    plot_evaluation_scatter(y_test, preds, RESULTS_DIR)
+    
+    test_loss, test_mae = model.evaluate(X_test, y_test, verbose=0)
+    print("Test Loss:", test_loss, "Test MAE:", test_mae)
+    val_corr, _ = pearsonr(y_test[:,0], preds[:,0])
+    aro_corr, _ = pearsonr(y_test[:,1], preds[:,1])
+    print("Valence Pearson Corr (scaled):", val_corr)
+    print("Arousal Pearson Corr (scaled):", aro_corr)
+    
+    # Inference on an example song
+    example_song = os.path.join(AUDIO_FOLDER, "25.mp3")  # Replace with a valid file ID
+    pred_song = predict_song_emotion(example_song, model, sr=SAMPLE_RATE, duration=CHUNK_DURATION, target_frames=TARGET_FRAMES)
+    if pred_song is not None:
+        print("Predicted (scaled) for example song:", pred_song)
+        print("Predicted (original scale) for example song:", invert_label(pred_song))
+    else:
+        print("Failed to predict for example song.")
+
+if __name__ == '__main__':
+    main()
