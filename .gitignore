@@ -2,3 +2,5 @@
 *.npz
 *.mp3
 audio_previews/
+deam-dataset/
+GTZAN-Dataset/

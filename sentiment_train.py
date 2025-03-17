@@ -4,7 +4,7 @@ import pandas as pd
 import librosa
 import librosa.display
 import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras import layers, models, callbacks # type: ignore
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
@@ -62,17 +62,14 @@ def invert_label(scaled):
 def compute_mel_spectrogram(y, sr):
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS,
                                        hop_length=HOP_LENGTH, fmin=FMIN, fmax=FMAX)
-    S_db = librosa.power_to_db(S, ref=np.max)
-    return S_db
+    return librosa.power_to_db(S, ref=np.max)
 
 def fix_spectrogram_length(S_db, target_frames=TARGET_FRAMES):
     n_mels, T = S_db.shape
-    if T < target_frames:
-        pad_width = target_frames - T
-        S_fixed = np.pad(S_db, ((0,0),(0,pad_width)), mode='constant')
-    else:
-        S_fixed = S_db[:, :target_frames]
-    return S_fixed
+    if T >= target_frames:
+        return S_db[:, :target_frames]
+    pad_width = target_frames - T
+    return np.pad(S_db, ((0,0),(0,pad_width)), mode='constant')
 
 def load_entire_song(file_path, sr=SAMPLE_RATE):
     try:
@@ -317,9 +314,7 @@ def predict_song_emotion(audio_path, model, sr=SAMPLE_RATE, seg_duration=SEGMENT
         batch_x = np.expand_dims(S_fixed, 0)
         pred = model.predict(batch_x)[0]
         seg_preds.append(pred)
-    if len(seg_preds) == 0:
-        return None
-    return np.mean(np.array(seg_preds), axis=0)
+    return np.mean(np.array(seg_preds), axis=0) if seg_preds else None
 
 # ----------------------------
 # PLOTTING TRAINING CURVES
@@ -350,14 +345,14 @@ def plot_training_curves(history, results_dir):
 # ----------------------------
 def main():
     multiprocessing.freeze_support()
-    
+
     print("Building multi-seg dataset from static CSV ...")
     X_list, Y, song_segment_map = build_multiseg_dataset(STATIC_CSV, AUDIO_FOLDER, seg_duration=SEGMENT_DURATION, max_songs=200)
     print("Number of segments:", len(X_list), "Label shape:", Y.shape)
     if len(X_list) == 0:
         print("No data loaded. Check your paths or dataset.")
         return
-    
+
     # Song-level split based on song index
     song_idxs = np.array([s_idx for (s_idx, seg_idx) in song_segment_map])
     unique_songs = np.unique(song_idxs)
@@ -367,34 +362,34 @@ def main():
     test_songs = unique_songs[cutoff:]
     train_mask = np.isin(song_idxs, train_songs)
     test_mask = np.isin(song_idxs, test_songs)
-    
+
     X_list_train = [X_list[i] for i in range(len(X_list)) if train_mask[i]]
     Y_train = Y[train_mask]
     map_train = [song_segment_map[i] for i in range(len(X_list)) if train_mask[i]]
-    
+
     X_list_test = [X_list[i] for i in range(len(X_list)) if test_mask[i]]
     Y_test = Y[test_mask]
     map_test = [song_segment_map[i] for i in range(len(X_list)) if test_mask[i]]
-    
+
     print("Train segments:", len(X_list_train), "Test segments:", len(X_list_test))
-    
+
     # Build model
     input_shape = (TARGET_FRAMES, N_MELS, 1)
     model = build_vgg_cnn(input_shape)
     model.summary()
-    
+
     # Create data generators
     batch_size = 8
     steps_train = int(np.ceil(len(X_list_train) / batch_size))
     steps_val = int(np.ceil(len(X_list_test) / batch_size))
     train_gen = data_generator(X_list_train, Y_train, batch_size=batch_size, train_mode=True)
     val_gen = data_generator_eval(X_list_test, Y_test, batch_size=batch_size)
-    
+
     # Callbacks
     checkpoint_path = os.path.join(RESULTS_DIR, "best_multiseg_vgg.h5")
     checkpoint_cb = callbacks.ModelCheckpoint(filepath=checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1)
     early_stop_cb = callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1)
-    
+
     history = model.fit(
         train_gen,
         validation_data=val_gen,
@@ -404,35 +399,37 @@ def main():
         callbacks=[checkpoint_cb, early_stop_cb],
         verbose=1
     )
-    
+
     # Save final model
     final_model_path = os.path.join(RESULTS_DIR, "final_multiseg_vgg.h5")
     model.save(final_model_path)
     print("Final model saved to:", final_model_path)
-    
+
     # Plot training curves
     plot_training_curves(history, RESULTS_DIR)
-    
+
     # Evaluate segment-level
     steps_eval = int(np.ceil(len(X_list_test) / batch_size))
     seg_gen = data_generator_eval(X_list_test, Y_test, batch_size=batch_size)
     seg_loss, seg_mae = model.evaluate(seg_gen, steps=steps_eval, verbose=0)
     seg_preds = model.predict(seg_gen, steps=steps_eval, verbose=0)
     print("Segment-Level Test MSE:", seg_loss, "MAE:", seg_mae)
-    val_corr_seg, _ = pearsonr(Y_test[:,0], seg_preds[:,0])
-    aro_corr_seg, _ = pearsonr(Y_test[:,1], seg_preds[:,1])
-    print("Segment-Level Valence Corr (scaled):", val_corr_seg)
-    print("Segment-Level Arousal Corr (scaled):", aro_corr_seg)
-    
+    _extracted_from_main_72(
+        Y_test,
+        seg_preds,
+        "Segment-Level Valence Corr (scaled):",
+        "Segment-Level Arousal Corr (scaled):",
+    )
     # Evaluate song-level
     y_true_song, y_pred_song = evaluate_song_level(X_list_test, Y_test, map_test, model, batch_size=batch_size)
-    val_corr_song, _ = pearsonr(y_true_song[:,0], y_pred_song[:,0])
-    aro_corr_song, _ = pearsonr(y_true_song[:,1], y_pred_song[:,1])
-    print("Song-Level Valence Corr (scaled):", val_corr_song)
-    print("Song-Level Arousal Corr (scaled):", aro_corr_song)
-    
+    _extracted_from_main_72(
+        y_true_song,
+        y_pred_song,
+        "Song-Level Valence Corr (scaled):",
+        "Song-Level Arousal Corr (scaled):",
+    )
     plot_scatter_song_level(y_true_song, y_pred_song, RESULTS_DIR)
-    
+
     # Inference on an example song
     example_sid = 25
     example_path = os.path.join(AUDIO_FOLDER, f"{example_sid}.mp3")
@@ -457,8 +454,8 @@ def main():
         batch_x = np.expand_dims(S_fixed, 0)
         seg_pred_scaled = model.predict(batch_x)[0]
         seg_preds_list.append(seg_pred_scaled)
-    
-    if len(seg_preds_list) > 0:
+
+    if seg_preds_list:
         seg_preds_arr = np.array(seg_preds_list)
         avg_pred_scaled = np.mean(seg_preds_arr, axis=0)
         print(f"Example Song ID: {example_sid}")
@@ -466,6 +463,14 @@ def main():
         print("Average Predicted (original scale):", invert_label(avg_pred_scaled))
     else:
         print("No segments for example song.")
+
+
+# TODO Rename this here and in `main`
+def _extracted_from_main_72(arg0, arg1, arg2, arg3):
+    val_corr_seg, _ = pearsonr(arg0[:,0], arg1[:,0])
+    aro_corr_seg, _ = pearsonr(arg0[:,1], arg1[:,1])
+    print(arg2, val_corr_seg)
+    print(arg3, aro_corr_seg)
 
 if __name__ == '__main__':
     main()

@@ -3,10 +3,10 @@ import numpy as np
 import librosa
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.utils import to_categorical # type: ignore
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report
-from tensorflow.image import resize
+from tensorflow.image import resize # type: ignore
 
 # ================================
 # Configuration

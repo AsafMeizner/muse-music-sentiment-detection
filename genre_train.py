@@ -4,12 +4,12 @@ import pandas as pd
 import librosa
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras.layers import Conv2D, MaxPool2D, Flatten, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.layers import Conv2D, MaxPool2D, Flatten, Dense, Dropout # type: ignore
+from tensorflow.keras.optimizers import Adam # type: ignore
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping # type: ignore
+from tensorflow.keras.utils import to_categorical # type: ignore
 from sklearn.model_selection import train_test_split
-from tensorflow.image import resize
+from tensorflow.image import resize # type: ignore
 
 # =============================================================================
 # Create a directory to save model and plots
