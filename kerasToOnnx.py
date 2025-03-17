@@ -4,11 +4,35 @@ from pathlib import Path
 import tensorflow as tf
 import tf2onnx
 
+# ----------------------------
+# Custom ScalingLayer Definition
+# ----------------------------
+class ScalingLayer(tf.keras.layers.Layer):
+    def __init__(self, initial_value=1.0, **kwargs):
+        super(ScalingLayer, self).__init__(**kwargs)
+        self.initial_value = initial_value
+
+    def build(self, input_shape):
+        self.alpha = self.add_weight(
+            name='alpha',
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.initial_value),
+            trainable=True
+        )
+        super(ScalingLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        return inputs * self.alpha
+
+    def get_config(self):
+        config = super(ScalingLayer, self).get_config()
+        config.update({"initial_value": self.initial_value})
+        return config
+
+# ----------------------------
+# Conversion Function
+# ----------------------------
 def convert_model(keras_model_path: Path, onnx_model_path: Path, custom_objects=None):
-    """
-    Load a Keras model from keras_model_path and convert it to ONNX format,
-    saving the result at onnx_model_path.
-    """
     if not keras_model_path.exists():
         print(f"ERROR: Keras model file not found: {keras_model_path}")
         return
@@ -23,11 +47,14 @@ def convert_model(keras_model_path: Path, onnx_model_path: Path, custom_objects=
     model_proto, _ = tf2onnx.convert.from_keras(model, input_signature=spec, output_path=str(onnx_model_path))
     print(f"ONNX model saved to {onnx_model_path}\n")
 
+# ----------------------------
+# Main Script
+# ----------------------------
 if __name__ == "__main__":
     # Get the directory containing this script.
     base_dir = Path(__file__).parent.absolute()
     
-    # Build absolute paths using pathlib.
+    # Build absolute paths relative to the working directory.
     sentiment_keras_path = base_dir / "setiment-results" / "best_multiseg_vgg.h5"
     genre_keras_path = base_dir / "genre_results" / "best_model.keras"
     
@@ -37,18 +64,11 @@ if __name__ == "__main__":
     print("Sentiment model absolute path:", sentiment_keras_path)
     print("Genre model absolute path:", genre_keras_path)
     
-    # If your model uses any custom layers (e.g. ScalingLayer), import and add them here.
-    custom_objects = {}
-    try:
-        # Update the module name as necessary.
-        from your_custom_module import ScalingLayer  # type: ignore
-        custom_objects["ScalingLayer"] = ScalingLayer
-        print("Custom object 'ScalingLayer' loaded.")
-    except ImportError:
-        print("No custom objects to load or 'ScalingLayer' not found. Continuing without custom objects.")
-
-    # Convert the sentiment model
+    # Provide custom_objects with the ScalingLayer so the sentiment model loads correctly.
+    custom_objects = {"ScalingLayer": ScalingLayer}
+    
+    # Convert the sentiment model.
     convert_model(sentiment_keras_path, sentiment_onnx_path, custom_objects=custom_objects)
     
-    # Convert the genre model
+    # Convert the genre model.
     convert_model(genre_keras_path, genre_onnx_path, custom_objects=custom_objects)
