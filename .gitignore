@@ -4,4 +4,12 @@
 audio_previews/
 deam-dataset/
 GTZAN-Dataset/
-*/__pycache__/
+
+__pycache__/
+server/__pycache__/
+server/models/__pycache__/
+server/routers/__pycache__/
+server/utils/__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
