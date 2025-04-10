@@ -4,3 +4,4 @@
 audio_previews/
 deam-dataset/
 GTZAN-Dataset/
+*/__pycache__/
